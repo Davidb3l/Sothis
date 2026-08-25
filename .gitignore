@@ -1,0 +1,4 @@
+# Hayvenhurst (added by `hayven init`) — generated index + installed skill
+.hayven/
+.claude/skills/
+.agents/skills/
