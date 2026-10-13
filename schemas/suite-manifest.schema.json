@@ -1,0 +1,242 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Davidb3l/Sothis/main/schemas/suite-manifest.schema.json",
+  "title": "Sothis suite manifest v1",
+  "type": "object",
+  "required": ["$schema", "schemaVersion", "suiteVersion", "marketplace", "profiles", "tools"],
+  "properties": {
+    "$schema": { "type": "string", "minLength": 1 },
+    "schemaVersion": { "const": 1 },
+    "suiteVersion": { "$ref": "#/$defs/version" },
+    "marketplace": { "$ref": "#/$defs/marketplace" },
+    "profiles": {
+      "type": "object",
+      "required": ["core", "full"],
+      "minProperties": 2,
+      "additionalProperties": { "$ref": "#/$defs/profile" }
+    },
+    "tools": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/tool" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    },
+    "marketplaceRef": {
+      "type": "object",
+      "required": ["name", "repository"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "repository": { "$ref": "#/$defs/repository" }
+      },
+      "additionalProperties": false
+    },
+    "marketplace": {
+      "type": "object",
+      "required": ["canonical", "legacy"],
+      "properties": {
+        "canonical": {
+          "type": "object",
+          "required": ["name", "repository"],
+          "properties": {
+            "name": { "const": "sothis" },
+            "repository": { "const": "Davidb3l/Sothis" }
+          },
+          "additionalProperties": false
+        },
+        "legacy": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "repository", "removeAfterSuiteReleases"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "repository": { "$ref": "#/$defs/repository" },
+              "removeAfterSuiteReleases": { "type": "integer", "minimum": 1 }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "profile": {
+      "type": "object",
+      "required": ["description", "tools"],
+      "properties": {
+        "description": { "type": "string", "minLength": 1 },
+        "tools": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z0-9-]+$" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "plugin": {
+      "type": "object",
+      "required": ["name", "marketplace"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+        "marketplace": { "const": "sothis" },
+        "minimumVersion": {
+          "description": "Oldest installed plugin version the suite supports; sothis doctor compares it with installed_plugins.json.",
+          "$ref": "#/$defs/version"
+        }
+      },
+      "additionalProperties": false
+    },
+    "distribution": {
+      "type": "object",
+      "required": ["kind", "verification"],
+      "properties": {
+        "kind": { "enum": ["tool-installer", "plugin-runtime", "source"] },
+        "verification": { "enum": ["sha256", "sha256+sigstore", "plugin-manager", "source-build"] },
+        "runtime": { "type": "string", "minLength": 1 },
+        "runtimeMinimumVersion": {
+          "description": "Oldest acceptable `<runtime> --version`; plugin-runtime distributions only.",
+          "$ref": "#/$defs/version"
+        },
+        "assets": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/platformKey" },
+          "additionalProperties": { "type": "string", "minLength": 1 }
+        },
+        "checksumSuffix": { "const": ".sha256" },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/fileEntry" }
+        },
+        "sigstoreIdentity": {
+          "type": "string",
+          "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\\.github/workflows/release\\.yml@refs/tags/v\\{version\\}$"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "tool-installer" } }, "required": ["kind"] },
+          "then": {
+            "required": ["assets", "checksumSuffix", "files"],
+            "properties": {
+              "verification": { "enum": ["sha256", "sha256+sigstore"] },
+              "assets": { "minProperties": 1 }
+            },
+            "not": { "required": ["runtimeMinimumVersion"] }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "plugin-runtime" } }, "required": ["kind"] },
+          "then": {
+            "required": ["runtime"],
+            "properties": {
+              "verification": { "const": "plugin-manager" },
+              "assets": { "maxProperties": 0 }
+            },
+            "not": { "anyOf": [{ "required": ["checksumSuffix"] }, { "required": ["sigstoreIdentity"] }, { "required": ["files"] }] }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "source" } }, "required": ["kind"] },
+          "then": {
+            "properties": {
+              "verification": { "const": "source-build" },
+              "assets": { "maxProperties": 0 }
+            },
+            "not": { "anyOf": [{ "required": ["checksumSuffix"] }, { "required": ["sigstoreIdentity"] }, { "required": ["files"] }, { "required": ["runtimeMinimumVersion"] }] }
+          }
+        },
+        {
+          "if": { "properties": { "verification": { "const": "sha256+sigstore" } }, "required": ["verification"] },
+          "then": { "required": ["sigstoreIdentity"] }
+        }
+      ]
+    },
+    "fileEntry": {
+      "description": "A single top-level payload name; {exe} expands to .exe on Windows. Keep in parity with manifest::validate_file_entry.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_+-](?:[A-Za-z0-9_.+-]|\\{exe\\})*$",
+      "not": { "pattern": "\\.\\." }
+    },
+    "platformKey": {
+      "enum": ["linux-x64", "linux-arm64", "macos-x64", "macos-arm64", "windows-x64", "windows-arm64"]
+    },
+    "platform": {
+      "type": "object",
+      "required": ["support"],
+      "properties": {
+        "support": { "enum": ["native", "native-preview", "plugin-runtime", "source-only", "wsl2", "unsupported"] },
+        "note": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "platforms": {
+      "type": "object",
+      "required": ["linux-x64", "linux-arm64", "macos-x64", "macos-arm64", "windows-x64", "windows-arm64"],
+      "properties": {
+        "linux-x64": { "$ref": "#/$defs/platform" },
+        "linux-arm64": { "$ref": "#/$defs/platform" },
+        "macos-x64": { "$ref": "#/$defs/platform" },
+        "macos-arm64": { "$ref": "#/$defs/platform" },
+        "windows-x64": { "$ref": "#/$defs/platform" },
+        "windows-arm64": { "$ref": "#/$defs/platform" }
+      },
+      "additionalProperties": false
+    },
+    "tool": {
+      "type": "object",
+      "required": ["id", "name", "repository", "distribution", "platforms"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+        "name": { "type": "string", "minLength": 1 },
+        "command": { "type": "string", "minLength": 1 },
+        "repository": { "$ref": "#/$defs/repository" },
+        "minimumVersion": { "$ref": "#/$defs/version" },
+        "recommendedVersion": { "$ref": "#/$defs/version" },
+        "contracts": { "type": "object" },
+        "plugin": { "$ref": "#/$defs/plugin" },
+        "distribution": { "$ref": "#/$defs/distribution" },
+        "platforms": { "$ref": "#/$defs/platforms" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "distribution": {
+                "properties": { "kind": { "const": "tool-installer" } },
+                "required": ["kind"]
+              }
+            },
+            "required": ["distribution"]
+          },
+          "then": { "required": ["command", "minimumVersion", "recommendedVersion"] }
+        },
+        {
+          "if": {
+            "properties": {
+              "distribution": {
+                "properties": { "kind": { "const": "plugin-runtime" } },
+                "required": ["kind"]
+              }
+            },
+            "required": ["distribution"]
+          },
+          "then": { "required": ["plugin"] }
+        }
+      ]
+    }
+  }
+}

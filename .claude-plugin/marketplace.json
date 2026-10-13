@@ -1,0 +1,42 @@
+{
+  "name": "sothis",
+  "description": "The canonical Sothis suite marketplace. Sothis owns suite installation and compatibility; each member tool remains independently installable and owns its own runtime state.",
+  "owner": {
+    "name": "Sothis",
+    "email": "info@anchorsanvils.com"
+  },
+  "plugins": [
+    {
+      "name": "sothis",
+      "source": "./plugin",
+      "version": "0.1.0",
+      "description": "Install, validate, and diagnose the Sothis suite from its canonical manifest."
+    },
+    {
+      "name": "sirius",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/Davidb3l/Sirius-Forester.git",
+        "path": "plugin"
+      },
+      "description": "The Sothis foreman: claim, lock, brief, execute, gate, and receipt."
+    },
+    {
+      "name": "hayvenhurst",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/Davidb3l/Hayvenhurst-dev.git",
+        "path": "plugin"
+      },
+      "description": "The persistent, trace-augmented code graph for structural navigation and coordination."
+    },
+    {
+      "name": "catryna",
+      "source": {
+        "source": "github",
+        "repo": "Davidb3l/Catryna-Wikinelli"
+      },
+      "description": "Living, git-versioned documentation for agents and humans."
+    }
+  ]
+}

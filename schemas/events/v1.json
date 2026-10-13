@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Davidb3l/Sothis/main/schemas/events/v1.json",
+  "title": "Sothis local event spine v1",
+  "type": "object",
+  "required": ["v", "id", "ts", "source", "type", "refs", "data"],
+  "properties": {
+    "v": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "ts": { "type": "string", "format": "date-time" },
+    "source": { "type": "string", "minLength": 1 },
+    "type": { "type": "string", "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)+$" },
+    "refs": { "type": "array", "items": { "type": "string" } },
+    "data": { "type": "object" }
+  },
+  "additionalProperties": false
+}

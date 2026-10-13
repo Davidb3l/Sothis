@@ -1,0 +1,4 @@
+# Scripts run by a POSIX sh must keep LF line endings even where git is
+# configured with core.autocrlf (Windows checkouts, Windows CI runners): a CR
+# at the end of a line breaks `set -eu` and every `case` arm.
+*.sh text eol=lf
