@@ -80,7 +80,7 @@
       "command": "hayven",
       "repository": "Davidb3l/Hayvenhurst-dev",
       "minimumVersion": "0.0.7",
-      "recommendedVersion": "0.0.8",
+      "recommendedVersion": "0.0.9",
       "plugin": { "name": "hayvenhurst", "marketplace": "sothis" },
       "distribution": {
         "kind": "tool-installer",

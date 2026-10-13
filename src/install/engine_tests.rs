@@ -337,7 +337,7 @@ fn a_core_install_places_verifies_and_receipts_every_tool() {
         ]
     );
     assert_eq!(h.bin_text("amt.exe"), "amt 0.4.2");
-    assert_eq!(h.bin_text("hayven.exe"), "hayven 0.0.8");
+    assert_eq!(h.bin_text("hayven.exe"), "hayven 0.0.9");
     assert_eq!(h.bin_text("sirius.exe"), "sirius 0.1.7");
     assert!(h
         .layout
@@ -365,18 +365,18 @@ fn a_core_install_places_verifies_and_receipts_every_tool() {
     assert_eq!(hayven.bin_dir, h.layout.bin);
     assert!(h
         .layout
-        .version_dir("hayvenhurst", "0.0.8")
+        .version_dir("hayvenhurst", "0.0.9")
         .join("LICENSE")
         .is_file());
-    assert!(receipt::read_meta(&h.layout.version_dir("hayvenhurst", "0.0.8")).is_ok());
+    assert!(receipt::read_meta(&h.layout.version_dir("hayvenhurst", "0.0.9")).is_ok());
 
     // Sigstore was checked for the signed tools only, with the substituted identity.
     let calls = h.verifier.calls.borrow().clone();
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert!(calls
         .iter()
-        .any(|c| c.contains("hayvenhurst-0.0.8-windows-x64.tar.gz")
-            && c.ends_with("Hayvenhurst-dev/.github/workflows/release.yml@refs/tags/v0.0.8")));
+        .any(|c| c.contains("hayvenhurst-0.0.9-windows-x64.tar.gz")
+            && c.ends_with("Hayvenhurst-dev/.github/workflows/release.yml@refs/tags/v0.0.9")));
 
     assert!(summary.path_changed);
     assert!(h
@@ -427,7 +427,7 @@ fn modified_installed_files_are_repaired_by_a_reinstall() {
 #[test]
 fn a_tampered_download_fails_on_sha256_and_leaves_the_bin_untouched() {
     let mut h = Harness::new();
-    let path = h.asset_path("hayvenhurst", "0.0.8");
+    let path = h.asset_path("hayvenhurst", "0.0.9");
     let mut bytes = fs::read(&path).unwrap();
     let middle = bytes.len() / 2;
     bytes[middle] ^= 0x01;
@@ -1006,7 +1006,7 @@ fn a_failing_plugin_install_is_reported_without_undoing_the_binary() {
     let summary = h.run(&options).unwrap();
     assert!(!summary.ok);
     assert!(item(&summary, "hayvenhurst", "install_plugin").failed);
-    assert_eq!(h.bin_text("hayven.exe"), "hayven 0.0.8");
+    assert_eq!(h.bin_text("hayven.exe"), "hayven 0.0.9");
 }
 
 // ------------------------------------------------------------------- update

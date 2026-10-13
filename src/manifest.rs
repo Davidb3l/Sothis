@@ -754,7 +754,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(recommended("ametrite"), "0.4.2");
-        assert_eq!(recommended("hayvenhurst"), "0.0.8");
+        assert_eq!(recommended("hayvenhurst"), "0.0.9");
         assert_eq!(recommended("sirius-forester"), "0.1.7");
     }
 
