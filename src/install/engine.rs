@@ -101,10 +101,12 @@ impl VersionProbe for RealProbe {
 
 pub enum PathMode<'a> {
     /// Edit the user PATH through a store (Windows registry).
+    /// Constructed on Windows (and by tests).
+    #[cfg_attr(not(windows), allow(dead_code))]
     Store(&'a mut dyn PathStore),
     /// Never edit anything; print the line to add (macOS/Linux).
     /// Constructed on macOS/Linux (and by tests).
-    #[allow(dead_code)]
+    #[cfg_attr(windows, allow(dead_code))]
     Advisory,
 }
 

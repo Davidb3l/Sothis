@@ -276,7 +276,17 @@ function Install-Sothis {
         $expected = $match.Groups[1].Value.ToLowerInvariant()
         $named = $match.Groups[2].Value.Trim()
         if ($named -cne $asset) { throw ("{0}.sha256 names '{1}', not '{0}'" -f $asset, $named) }
-        $actual = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        # .NET directly, not Get-FileHash: that is a script function in a module,
+        # and Windows PowerShell 5.1 started from PowerShell 7 inherits a
+        # PSModulePath that cannot load it ("Get-FileHash is not recognized").
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $stream = [System.IO.File]::OpenRead($assetPath)
+        try {
+            $actual = ([System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
+        } finally {
+            $stream.Dispose()
+            $sha.Dispose()
+        }
         if ($actual -ne $expected) {
             throw ('sha256 mismatch for {0}: published {1}, downloaded {2}; the download is corrupt or has been tampered with. Nothing was installed.' -f $asset, $expected, $actual)
         }
@@ -305,7 +315,8 @@ function Install-Sothis {
         } finally {
             $zip.Dispose()
         }
-        Expand-Archive -LiteralPath $assetPath -DestinationPath $extract -Force
+        # Same reason as the hash above: Expand-Archive is a module script function.
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($assetPath, $extract)
         $newExe = Join-Path (Join-Path $extract $topDir) 'sothis.exe'
         if (-not (Test-Path -LiteralPath $newExe -PathType Leaf)) { throw ('{0} does not contain {1}/sothis.exe' -f $asset, $topDir) }
         if ((Get-Item -LiteralPath $newExe -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
