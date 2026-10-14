@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native-cli:
+    name: native CLI (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
+      - name: Validate embedded manifest
+        run: cargo run --locked -- manifest validate
+      - name: Resolve the native host plan
+        run: cargo run --locked -- install --profile full --plan --json
+      - name: PowerShell-only Windows contract
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $plan = target/debug/sothis.exe install --profile full --platform windows-x64 --plan --json | ConvertFrom-Json
+          if ($plan.platform -ne 'windows-x64') { throw 'wrong platform' }
+          if (($plan.items | Where-Object tool -eq 'guignet').action -ne 'use_wsl2') { throw 'Guignet must remain WSL2' }
+          if (($plan.items | Where-Object tool -eq 'pingmybell').action -ne 'build_from_source') { throw 'PingMyBell must be source-only on Windows' }
+          $badText = target/debug/sothis.exe manifest validate unexpected --json
+          $badExit = $LASTEXITCODE
+          $bad = $badText | ConvertFrom-Json
+          if ($badExit -ne 2 -or $bad.ok -ne $false) { throw 'invalid arguments must fail closed with exit 2' }
+          $duplicateText = target/debug/sothis.exe install --profile core --profile full --plan --json
+          $duplicateExit = $LASTEXITCODE
+          $duplicate = $duplicateText | ConvertFrom-Json
+          if ($duplicateExit -ne 2 -or $duplicate.ok -ne $false) { throw 'duplicate options must fail closed with exit 2' }
+
+          $tempRoot = Join-Path $env:RUNNER_TEMP 'sothis init spaces ü'
+          New-Item -ItemType Directory -Path $tempRoot | Out-Null
+          $first = target/debug/sothis.exe init $tempRoot --json | ConvertFrom-Json
+          $second = target/debug/sothis.exe init $tempRoot --json | ConvertFrom-Json
+          if (-not $first.result.createdConfig) { throw 'first init did not create config' }
+          if ($second.result.createdConfig -or $second.result.updatedIgnore) { throw 'second init was not idempotent' }
+      - name: Lints
+        if: runner.os == 'Linux'
+        run: |
+          cargo fmt --all --check
+          cargo clippy --all-targets --locked -- -D warnings
+
+  msrv:
+    name: Rust 1.89 minimum supported version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  # The REAL network install (partial SOT-15): downloads the published Windows,
+  # macOS and Linux assets of the core tools into a throwaway SOTHIS_HOME,
+  # verifies them (sha256 + Sigstore through cosign), runs them, proves a second
+  # install is a no-op, then uninstalls. Never touches the runner's PATH
+  # (--no-modify-path) or Claude plugins (--no-plugins).
+  e2e-install:
+    name: install e2e (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Build
+        run: cargo build --locked
+      - name: Bootstrap script syntax (sh)
+        shell: bash
+        run: sh -n scripts/install.sh
+      - name: Bootstrap script syntax (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD/scripts/install.ps1", [ref]$null, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host "::error::$($_.Message) at line $($_.Extent.StartLineNumber)" }
+            exit 1
+          }
+          Write-Host 'scripts/install.ps1 parses cleanly'
+      - name: Install the core profile for real, then re-run, then uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $suffix = if ($env:OS -eq 'Windows_NT') { '.exe' } else { '' }
+          $sothis = Join-Path (Join-Path (Get-Location).Path 'target') (Join-Path 'debug' "sothis$suffix")
+          $sothisHome = Join-Path $env:RUNNER_TEMP 'sothis-home'
+          $env:SOTHIS_HOME = $sothisHome
+          $bin = Join-Path $sothisHome 'bin'
+
+          function Invoke-Sothis([string[]]$Arguments) {
+            # JSON on stdout; the human summary and warnings go to stderr.
+            $text = (& $sothis @Arguments) -join "`n"
+            $code = $LASTEXITCODE
+            Write-Host "sothis $($Arguments -join ' ') -> exit $code"
+            Write-Host $text
+            if ($code -ne 0) { throw "sothis $($Arguments -join ' ') exited $code" }
+            return ($text | ConvertFrom-Json)
+          }
+
+          $manifest = Invoke-Sothis @('manifest', 'show')
+          $recommended = @{}
+          foreach ($tool in $manifest.tools) { $recommended[$tool.id] = $tool.recommendedVersion }
+
+          # 1. First install: everything installed, verified, placed.
+          $first = Invoke-Sothis @('install', '--profile', 'core', '--no-modify-path', '--no-plugins', '--json')
+          if (-not $first.ok) { throw 'first install did not report ok' }
+          if ($first.items.Count -ne 3) { throw "expected 3 items, got $($first.items.Count)" }
+          foreach ($item in $first.items) {
+            if ($item.result -ne 'installed') { throw "$($item.tool) was '$($item.result)', expected 'installed'" }
+          }
+
+          # 2. Every placed command runs and reports the recommended version.
+          $commands = @{ ametrite = 'amt'; hayvenhurst = 'hayven'; 'sirius-forester' = 'sirius' }
+          foreach ($id in $commands.Keys) {
+            $exe = Join-Path $bin ($commands[$id] + $suffix)
+            if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "$exe was not placed" }
+            $reported = (& $exe --version) -join ' '
+            if ($LASTEXITCODE -ne 0) { throw "$exe --version exited $LASTEXITCODE" }
+            if (-not $reported.Contains($recommended[$id])) { throw "$exe reported '$reported', expected $($recommended[$id])" }
+            Write-Host "$exe -> $reported"
+          }
+          foreach ($entry in @("hayven-native$suffix", 'skill', 'viewer')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $bin $entry))) { throw "hayvenhurst payload entry $entry was not placed" }
+          }
+
+          # 3. Re-running changes nothing.
+          $second = Invoke-Sothis @('install', '--profile', 'core', '--no-modify-path', '--no-plugins', '--json')
+          if (-not $second.ok) { throw 'second install did not report ok' }
+          foreach ($item in $second.items) {
+            if ($item.result -ne 'already-installed') { throw "$($item.tool) was '$($item.result)' on re-run, expected 'already-installed'" }
+          }
+
+          # 4. Uninstall removes everything Sothis placed.
+          $removed = Invoke-Sothis @('uninstall', '--profile', 'core', '--no-modify-path', '--json')
+          if (-not $removed.ok) { throw 'uninstall did not report ok' }
+          foreach ($item in $removed.items) {
+            if ($item.result -ne 'removed') { throw "$($item.tool) was '$($item.result)' on uninstall, expected 'removed'" }
+          }
+          if (Test-Path -LiteralPath $bin) {
+            $left = @(Get-ChildItem -LiteralPath $bin -Force)
+            if ($left.Count -ne 0) { throw "bin directory is not empty after uninstall: $($left.Name -join ', ')" }
+          }
+          Write-Host 'real install, re-install and uninstall all behaved'

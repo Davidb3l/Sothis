@@ -1,0 +1,212 @@
+{
+  "$schema": "./schemas/suite-manifest.schema.json",
+  "schemaVersion": 1,
+  "suiteVersion": "0.1.0",
+  "marketplace": {
+    "canonical": {
+      "name": "sothis",
+      "repository": "Davidb3l/Sothis"
+    },
+    "legacy": [
+      {
+        "name": "sirius-forester",
+        "repository": "Davidb3l/Sirius-Forester",
+        "removeAfterSuiteReleases": 2
+      }
+    ]
+  },
+  "profiles": {
+    "core": {
+      "description": "The board, code graph, and foreman required for the supervised loop.",
+      "tools": ["ametrite", "hayvenhurst", "sirius-forester"]
+    },
+    "docs": {
+      "description": "Core plus living documentation.",
+      "tools": ["ametrite", "hayvenhurst", "sirius-forester", "catryna-wikinelli"]
+    },
+    "bell": {
+      "description": "The optional human-notification surface where it is supported.",
+      "tools": ["pingmybell"]
+    },
+    "eval": {
+      "description": "The local evaluation/referee tool.",
+      "tools": ["guignet"]
+    },
+    "full": {
+      "description": "Every tool supported by, or explicitly bridged for, the current platform.",
+      "tools": [
+        "ametrite",
+        "hayvenhurst",
+        "sirius-forester",
+        "catryna-wikinelli",
+        "pingmybell",
+        "guignet"
+      ]
+    }
+  },
+  "tools": [
+    {
+      "id": "ametrite",
+      "name": "Ametrite",
+      "command": "amt",
+      "repository": "Davidb3l/Ametrite",
+      "minimumVersion": "0.3.0",
+      "recommendedVersion": "0.4.2",
+      "contracts": { "minimumSchemaVersion": 3 },
+      "distribution": {
+        "kind": "tool-installer",
+        "verification": "sha256",
+        "checksumSuffix": ".sha256",
+        "files": ["amt{exe}"],
+        "assets": {
+          "linux-x64": "amt-x86_64-unknown-linux-gnu.tar.xz",
+          "macos-x64": "amt-x86_64-apple-darwin.tar.xz",
+          "macos-arm64": "amt-aarch64-apple-darwin.tar.xz",
+          "windows-x64": "amt-x86_64-pc-windows-msvc.zip"
+        }
+      },
+      "platforms": {
+        "linux-x64": { "support": "native" },
+        "linux-arm64": { "support": "source-only", "note": "No Linux ARM64 release asset is currently published; build the Rust CLI from source." },
+        "macos-x64": { "support": "native" },
+        "macos-arm64": { "support": "native" },
+        "windows-x64": { "support": "native" },
+        "windows-arm64": { "support": "unsupported", "note": "No native Windows ARM64 release is published." }
+      }
+    },
+    {
+      "id": "hayvenhurst",
+      "name": "Hayvenhurst",
+      "command": "hayven",
+      "repository": "Davidb3l/Hayvenhurst-dev",
+      "minimumVersion": "0.0.7",
+      "recommendedVersion": "0.0.9",
+      "plugin": { "name": "hayvenhurst", "marketplace": "sothis" },
+      "distribution": {
+        "kind": "tool-installer",
+        "verification": "sha256+sigstore",
+        "checksumSuffix": ".sha256",
+        "sigstoreIdentity": "https://github.com/Davidb3l/Hayvenhurst-dev/.github/workflows/release.yml@refs/tags/v{version}",
+        "files": ["hayven{exe}", "hayven-native{exe}", "skill", "viewer"],
+        "assets": {
+          "linux-x64": "hayvenhurst-{version}-linux-x64-glibc.tar.gz",
+          "linux-arm64": "hayvenhurst-{version}-linux-arm64.tar.gz",
+          "macos-x64": "hayvenhurst-{version}-macos-x64.tar.gz",
+          "macos-arm64": "hayvenhurst-{version}-macos-arm64.tar.gz",
+          "windows-x64": "hayvenhurst-{version}-windows-x64.tar.gz"
+        }
+      },
+      "platforms": {
+        "linux-x64": { "support": "native" },
+        "linux-arm64": { "support": "native" },
+        "macos-x64": { "support": "native" },
+        "macos-arm64": { "support": "native" },
+        "windows-x64": { "support": "native" },
+        "windows-arm64": { "support": "unsupported", "note": "No native Windows ARM64 release is published." }
+      }
+    },
+    {
+      "id": "sirius-forester",
+      "name": "Sirius Forester",
+      "command": "sirius",
+      "repository": "Davidb3l/Sirius-Forester",
+      "minimumVersion": "0.1.1",
+      "recommendedVersion": "0.1.7",
+      "contracts": {
+        "minimumAmetriteSchemaVersion": 3,
+        "minimumHayvenVersion": "0.0.7"
+      },
+      "plugin": { "name": "sirius", "marketplace": "sothis" },
+      "distribution": {
+        "kind": "tool-installer",
+        "verification": "sha256+sigstore",
+        "checksumSuffix": ".sha256",
+        "sigstoreIdentity": "https://github.com/Davidb3l/Sirius-Forester/.github/workflows/release.yml@refs/tags/v{version}",
+        "files": ["sirius{exe}"],
+        "assets": {
+          "linux-x64": "sirius-forester-{version}-linux-x64-glibc.tar.gz",
+          "linux-arm64": "sirius-forester-{version}-linux-arm64.tar.gz",
+          "macos-x64": "sirius-forester-{version}-macos-x64.tar.gz",
+          "macos-arm64": "sirius-forester-{version}-macos-arm64.tar.gz",
+          "windows-x64": "sirius-forester-{version}-windows-x64.tar.gz"
+        }
+      },
+      "platforms": {
+        "linux-x64": { "support": "native" },
+        "linux-arm64": { "support": "native" },
+        "macos-x64": { "support": "native" },
+        "macos-arm64": { "support": "native" },
+        "windows-x64": {
+          "support": "native-preview",
+          "note": "Binary is native; the complete loop remains preview until shell-free execution passes the native Windows E2E lane."
+        },
+        "windows-arm64": {
+          "support": "unsupported",
+          "note": "No native Windows ARM64 release is published."
+        }
+      }
+    },
+    {
+      "id": "catryna-wikinelli",
+      "name": "Catryna Wikinelli",
+      "command": "bun",
+      "repository": "Davidb3l/Catryna-Wikinelli",
+      "plugin": { "name": "catryna", "marketplace": "sothis", "minimumVersion": "1.3.1" },
+      "distribution": {
+        "kind": "plugin-runtime",
+        "verification": "plugin-manager",
+        "runtime": "bun",
+        "runtimeMinimumVersion": "1.2.0"
+      },
+      "platforms": {
+        "linux-x64": { "support": "plugin-runtime" },
+        "linux-arm64": { "support": "plugin-runtime" },
+        "macos-x64": { "support": "plugin-runtime" },
+        "macos-arm64": { "support": "plugin-runtime" },
+        "windows-x64": { "support": "plugin-runtime", "note": "MCP launcher and hooks are shell-free from 1.3.1 (earlier versions need Git Bash)." },
+        "windows-arm64": { "support": "unsupported", "note": "The suite has not gated the Bun plugin runtime on Windows ARM64." }
+      }
+    },
+    {
+      "id": "pingmybell",
+      "name": "PingMyBell",
+      "repository": "Davidb3l/pingmybell",
+      "distribution": { "kind": "source", "verification": "source-build" },
+      "platforms": {
+        "linux-x64": { "support": "unsupported" },
+        "linux-arm64": { "support": "unsupported" },
+        "macos-x64": { "support": "source-only" },
+        "macos-arm64": { "support": "source-only" },
+        "windows-x64": {
+          "support": "source-only",
+          "note": "Builds and passes its test suite on Windows 11; focus-aware quieting verified live. No jump-to-session, installer, or CI runtime gate yet."
+        },
+        "windows-arm64": {
+          "support": "unsupported",
+          "note": "Windows APIs are scaffolded but the application has not been gated on Windows."
+        }
+      }
+    },
+    {
+      "id": "guignet",
+      "name": "Guignet",
+      "command": "guignet",
+      "repository": "Davidb3l/Guignet",
+      "distribution": { "kind": "source", "verification": "source-build", "runtime": "bun" },
+      "platforms": {
+        "linux-x64": { "support": "source-only" },
+        "linux-arm64": { "support": "source-only" },
+        "macos-x64": { "support": "source-only" },
+        "macos-arm64": { "support": "source-only" },
+        "windows-x64": {
+          "support": "wsl2",
+          "note": "Use WSL2 for the supported POSIX execution path; native Windows is experimental."
+        },
+        "windows-arm64": {
+          "support": "wsl2",
+          "note": "Use an ARM64 WSL2 distribution; native Windows is experimental."
+        }
+      }
+    }
+  ]
+}

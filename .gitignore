@@ -2,3 +2,12 @@
 .hayven/
 .claude/skills/
 .agents/skills/
+
+# Rust build output
+target/
+
+# Sothis project runtime state (the nested .suite/.gitignore keeps config trackable)
+.suite/events/
+.suite/state/
+.suite/staging/
+.suite/rollback/

@@ -1,0 +1,14 @@
+{
+  "name": "sothis",
+  "version": "0.1.0",
+  "description": "The canonical distribution and compatibility plugin for the Sothis suite.",
+  "author": {
+    "name": "Sothis",
+    "email": "info@anchorsanvils.com",
+    "url": "https://github.com/Davidb3l/Sothis"
+  },
+  "homepage": "https://github.com/Davidb3l/Sothis",
+  "repository": "https://github.com/Davidb3l/Sothis",
+  "license": "MIT",
+  "keywords": ["sothis", "suite", "installer", "compatibility", "windows", "agents"]
+}
