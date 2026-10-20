@@ -256,7 +256,7 @@ mod windows_store {
                 .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
                 .map_err(|e| format!("could not open HKCU\\Environment for writing: {e}"))?;
             let raw = RegValue {
-                bytes: encode(&value.value),
+                bytes: encode(&value.value).into(),
                 vtype: if value.expandable {
                     REG_EXPAND_SZ
                 } else {

@@ -268,7 +268,10 @@ fn run_zip(archive: &Path, sink: &mut Sink<'_>) -> Result<(), String> {
         let mut entry = zip
             .by_index(index)
             .map_err(|e| format!("could not read zip entry {index}: {e}"))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|e| format!("could not read the name of zip entry {index}: {e}"))?
+            .into_owned();
         let mode = entry.unix_mode();
         if let Some(mode) = mode {
             // S_IFMT: only regular files and directories are allowed.
