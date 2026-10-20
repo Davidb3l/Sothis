@@ -753,9 +753,9 @@ mod tests {
                 .clone()
                 .unwrap()
         };
-        assert_eq!(recommended("ametrite"), "0.4.2");
-        assert_eq!(recommended("hayvenhurst"), "0.0.9");
-        assert_eq!(recommended("sirius-forester"), "0.1.7");
+        assert_eq!(recommended("ametrite"), "0.5.0");
+        assert_eq!(recommended("hayvenhurst"), "0.0.10");
+        assert_eq!(recommended("sirius-forester"), "0.1.8");
     }
 
     #[test]
@@ -925,7 +925,8 @@ mod tests {
         // 0.3.0 bound the board to 127.0.0.1 and added Host/cross-origin guards.
         let ametrite = tool(&manifest, "ametrite");
         assert_eq!(ametrite.minimum_version.as_deref(), Some("0.3.0"));
-        assert_eq!(ametrite.recommended_version.as_deref(), Some("0.4.2"));
+        // (Recommended versions are pinned in one place:
+        // recommended_versions_track_the_published_releases.)
         // The SQLite meta.schema_version, not `amt doctor --json`'s envelope.
         assert_eq!(ametrite.contracts["minimumSchemaVersion"], 3);
 
