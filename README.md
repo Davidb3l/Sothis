@@ -147,7 +147,7 @@ through the `claude` CLI (`sothis@sothis`, plus each tool's plugin). Pass
 ### Day to day
 
 ```sh
-sothis update              # move managed tools to the manifest's recommended versions
+sothis update              # move managed tools to the manifest's recommended versions and refresh installed suite plugins
 sothis rollback <tool>     # return one tool to its previous retained version
 sothis uninstall           # remove what Sothis installed, in reverse order (--plugins also removes plugins)
 sothis doctor              # check the install (see below)
@@ -156,7 +156,14 @@ sothis manifest validate   # validate the embedded suite contract
 ```
 
 `update` never downgrades without `--allow-downgrade`, and leaves tools it did
-not install alone (reporting them as `unmanaged`). `uninstall` never touches
+not install alone (reporting them as `unmanaged`). It also refreshes the Claude
+plugins: one `claude plugin marketplace update sothis`, then `claude plugin
+update <name>@sothis` for each suite plugin that is installed (the tools' plugins
+and `sothis@sothis`), each reported as `updated`, `up-to-date` or `failed`
+(restart Claude Code to apply). A failed plugin step never changes the result of
+a binary update; `--no-plugins` skips all of it, and `sothis update --plan` lists
+the steps. `sothis install` only installs missing plugins; for one that is
+already installed it says to run `sothis update`. `uninstall` never touches
 tool data (`.ametrite`, `.hayven`, `.sirius`, `.suite`).
 
 `sothis doctor [--profile <p>]` exits `0` only when nothing it checks has
@@ -400,7 +407,7 @@ rolled back.
 - **`os error 4551`** on Windows: see
   [Windows Smart App Control](#windows-smart-app-control).
 
-Update the suite plugin with `claude plugin update sothis@sothis` when a new
+Update the suite plugin (and the tools' plugins) with `sothis update` when a new
 release lands. A tool you installed some other way is left alone: `sothis
 update` reports it as `unmanaged`, and `sothis install` takes it over only after
 backing the existing file up.

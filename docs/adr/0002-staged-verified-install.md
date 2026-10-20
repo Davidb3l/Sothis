@@ -137,3 +137,23 @@ replaces everything):
    `--allow-virtualized-root` is given (`uninstall` and `rollback` stay possible
    so an old install can still be removed). `SOTHIS_ASSUME_PACKAGE` makes the
    process report a package for tests; it can only make the checks stricter.
+
+## Amendment (v0.1.1): plugins are refreshed by `update`
+
+Date: 2026-10-20. Extends item 9 (Plugins) above.
+
+`install` only ever added a missing plugin, so an installed plugin was reported
+as `already-installed` forever while the marketplace moved on (a real machine
+kept `hayvenhurst@sothis` 0.0.9 when 0.0.10 was current, likewise `sirius` and
+`catryna`). Now `sothis update` runs `claude plugin marketplace update sothis`
+once and then `claude plugin update <name>@sothis` for each canonical suite
+plugin that is installed (every manifest tool's plugin, plus `sothis@sothis`),
+recording one `update_plugin` step each: `updated`, `up-to-date` (parsed from
+what the CLI prints; unrecognised successful output is reported verbatim as
+`checked`) or `failed`. A failed marketplace refresh skips the per-plugin
+updates, since they would compare against a stale catalog. Plugin failures are
+failed steps (exit 1) but never alter the binary results. Mutating `claude`
+commands are only ever run by `sothis` itself; the tests drive a fake runner.
+`install` keeps install semantics and, for an installed plugin, says to run
+`sothis update`. `--no-plugins` skips all of it and `update --plan` lists the
+steps.

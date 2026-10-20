@@ -149,6 +149,13 @@ D-2); `suite.manifest.json` records the window as `removeAfterSuiteReleases: 2`.
 `sothis doctor` passes a legacy install with a "migrate to" note, and
 `sothis install` reports the migration commands without touching it.
 
+`sothis install` installs a missing canonical plugin and leaves an installed one
+alone (telling the user to run `sothis update`). `sothis update` refreshes the
+installed canonical plugins: `claude plugin marketplace update <marketplace>`
+once, then `claude plugin update <name>@<marketplace>` for each installed
+plugin of a manifest tool and for `sothis@sothis`. Legacy identities are never
+updated. `--no-plugins` skips every plugin step.
+
 A tool's manifest `plugin.minimumVersion` is the oldest plugin version the
 suite supports. `sothis doctor` reads the highest installed version of
 `<name>@*` from `installed_plugins.json` (user and project installs alike),
