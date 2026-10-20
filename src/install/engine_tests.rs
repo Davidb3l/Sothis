@@ -78,6 +78,8 @@ struct Harness {
     store: FakeStore,
     path_dirs: Vec<PathBuf>,
     on_path: BTreeMap<String, PathBuf>,
+    legacy_root: Option<PathBuf>,
+    legacy_path_entries: Vec<String>,
 }
 
 fn opts(operation: Operation, profile: &str) -> Options {
@@ -137,6 +139,8 @@ impl Harness {
             },
             path_dirs: Vec::new(),
             on_path: BTreeMap::new(),
+            legacy_root: None,
+            legacy_path_entries: Vec::new(),
         };
         for (id, version) in FIXTURE_VERSIONS {
             harness.set_version(id, version);
@@ -253,6 +257,8 @@ impl Harness {
             layout: &self.layout,
             platform: PLATFORM,
             exe_suffix: ".exe",
+            legacy_root: self.legacy_root.clone(),
+            legacy_path_entries: self.legacy_path_entries.clone(),
         };
         let services = Services {
             fetcher: &fetcher,
@@ -837,6 +843,8 @@ fn an_unwritable_user_path_is_a_failed_step() {
         layout: &h.layout,
         platform: PLATFORM,
         exe_suffix: ".exe",
+        legacy_root: None,
+        legacy_path_entries: Vec::new(),
     };
     let mut store = FailingStore;
     let options = opts(Operation::Install, "core");
@@ -875,6 +883,8 @@ fn advisory_path_mode_prints_the_exact_line_and_never_writes() {
         layout: &h.layout,
         platform: PLATFORM,
         exe_suffix: ".exe",
+        legacy_root: None,
+        legacy_path_entries: Vec::new(),
     };
     let options = opts(Operation::Install, "core");
     let summary = engine::run(
@@ -1415,4 +1425,119 @@ fn a_failed_first_install_leaves_no_tool_directory_behind() {
     assert!(h.receipt("hayvenhurst").is_none());
     assert_eq!(h.bin_names(), ["amt.exe", "sirius.exe"]);
     h.assert_no_scratch();
+}
+
+// ------------------------------------------------- v0.1.0 root migration
+
+const LEGACY_BIN: &str = r"C:\Users\t\AppData\Local\Sothis\bin";
+
+#[test]
+fn a_v0_1_0_path_entry_is_migrated_while_other_entries_are_untouched() {
+    let mut h = Harness::new();
+    h.legacy_path_entries = vec![
+        r"%LOCALAPPDATA%\Sothis\bin".to_string(),
+        LEGACY_BIN.to_string(),
+    ];
+    h.store.value = Some(PathValue {
+        value: format!(r"C:\Windows;{LEGACY_BIN}\;C:\Tools"),
+        expandable: false,
+    });
+    let summary = h.install("core");
+    assert!(summary.ok, "{:#?}", summary.items);
+    let value = h.store.value.clone().unwrap();
+    assert_eq!(
+        value.value,
+        format!(r"{};C:\Windows;C:\Tools", h.layout.bin.display())
+    );
+    assert!(!value.expandable, "the value type is preserved");
+    let migrated = item(&summary, "sothis", "migrate_path");
+    assert_eq!(migrated.result, "migrated");
+    assert!(!migrated.failed);
+    assert!(migrated.detail.contains(r"%LOCALAPPDATA%\Sothis\bin"));
+    assert!(summary.path_changed);
+    // A second run has nothing left to migrate and does not write.
+    let writes = h.store.writes;
+    let again = h.install("core");
+    assert!(again.items.iter().all(|i| i.action != "migrate_path"));
+    assert_eq!(h.store.writes, writes);
+}
+
+#[test]
+fn the_unexpanded_legacy_spelling_is_migrated_too() {
+    let mut h = Harness::new();
+    h.legacy_path_entries = vec![r"%LOCALAPPDATA%\Sothis\bin".to_string()];
+    h.store.value = Some(PathValue {
+        value: r"%localappdata%\SOTHIS\bin;C:\keep".to_string(),
+        expandable: true,
+    });
+    let summary = h.install("core");
+    assert!(summary.ok);
+    assert_eq!(
+        h.path_value(),
+        format!(r"{};C:\keep", h.layout.bin.display())
+    );
+    assert_eq!(item(&summary, "sothis", "migrate_path").result, "migrated");
+}
+
+#[test]
+fn no_modify_path_does_not_migrate_the_legacy_entry() {
+    let mut h = Harness::new();
+    h.legacy_path_entries = vec![LEGACY_BIN.to_string()];
+    h.store.value = Some(PathValue {
+        value: format!(r"C:\Windows;{LEGACY_BIN}"),
+        expandable: true,
+    });
+    let mut options = opts(Operation::Install, "core");
+    options.modify_path = false;
+    let summary = h.run(&options).unwrap();
+    assert!(summary.ok);
+    assert_eq!(h.store.writes, 0);
+    assert!(summary.items.iter().all(|i| i.action != "migrate_path"));
+}
+
+#[test]
+fn legacy_receipts_are_reported_and_never_adopted_or_deleted() {
+    let mut h = Harness::new();
+    let legacy_root = h._dir.path().join("old-local").join("Sothis");
+    let receipts = legacy_root.join("state").join("receipts");
+    fs::create_dir_all(&receipts).unwrap();
+    fs::write(receipts.join("amt.json"), "{\"legacy\":true}").unwrap();
+    h.legacy_root = Some(legacy_root.clone());
+    let summary = h.install("core");
+    assert!(summary.ok, "{:#?}", summary.items);
+    let note = summary
+        .warnings
+        .iter()
+        .find(|w| w.contains("v0.1.0 install exists"))
+        .unwrap_or_else(|| panic!("no legacy warning in {:?}", summary.warnings));
+    assert!(note.contains(&legacy_root.display().to_string()));
+    assert!(note.contains("sothis uninstall --profile"));
+    assert!(note.contains("--no-modify-path"));
+    // Nothing at the old root was touched and nothing was adopted from it.
+    assert_eq!(
+        fs::read_to_string(receipts.join("amt.json")).unwrap(),
+        "{\"legacy\":true}"
+    );
+    assert!(h.receipt("ametrite").is_some());
+    assert!(!h.layout.root.starts_with(&legacy_root));
+}
+
+#[test]
+fn no_legacy_note_without_receipts_or_when_the_legacy_root_is_the_root() {
+    let mut h = Harness::new();
+    let legacy_root = h._dir.path().join("old-local").join("Sothis");
+    fs::create_dir_all(legacy_root.join("state").join("receipts")).unwrap();
+    h.legacy_root = Some(legacy_root);
+    let summary = h.install("core");
+    assert!(summary.warnings.iter().all(|w| !w.contains("v0.1.0")));
+
+    // SOTHIS_HOME pointed at the old root: its receipts are the live ones.
+    let mut same = Harness::new();
+    assert!(same.install("core").ok);
+    same.legacy_root = Some(same.layout.root.clone());
+    let summary = same.run(&opts(Operation::Update, "core")).unwrap();
+    assert!(summary
+        .warnings
+        .iter()
+        .all(|w| !w.contains("v0.1.0 install exists")));
 }

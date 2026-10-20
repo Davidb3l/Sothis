@@ -2,7 +2,9 @@
 //! output. Everything of substance lives in [`crate::install::engine`].
 
 use crate::install::engine::{self, Context, Operation, Options, PathMode, RealProbe, Services};
-use crate::install::layout::Layout;
+use crate::install::layout::{EnvVars, Layout};
+use crate::install::legacy;
+use crate::install::packaged::{self, PackageContext, RealPackageContext};
 use crate::install::plugins::RealClaude;
 use crate::install::source;
 use crate::install::verify::CosignVerifier;
@@ -19,6 +21,8 @@ type CliResult = Result<(), (i32, String)>;
 pub struct Parsed {
     pub options: Options,
     pub mirror: Option<PathBuf>,
+    /// `--allow-virtualized-root`: install under AppData even when packaged.
+    pub allow_virtualized_root: bool,
 }
 
 fn flag(args: &[String], name: &str) -> Result<bool, (i32, String)> {
@@ -45,6 +49,7 @@ pub fn parse(
                 "--allow-downgrade",
                 "--no-modify-path",
                 "--no-plugins",
+                "--allow-virtualized-root",
             ],
             &["--profile", "--mirror"],
         ),
@@ -108,7 +113,43 @@ pub fn parse(
         },
         rollback_tool,
     };
-    Ok(Parsed { options, mirror })
+    Ok(Parsed {
+        options,
+        mirror,
+        allow_virtualized_root: flag(args, "--allow-virtualized-root")?,
+    })
+}
+
+/// Refuse to install or update into a root that Windows would silently
+/// virtualize (see [`crate::install::packaged`]), unless explicitly allowed.
+/// Runs before anything is written. Uninstall and rollback stay possible so a
+/// v0.1.0 install can still be removed.
+pub fn guard_virtualized_root(
+    operation: Operation,
+    allow: bool,
+    layout: &Layout,
+    env: &EnvVars,
+    package: &dyn PackageContext,
+) -> CliResult {
+    if allow || !matches!(operation, Operation::Install | Operation::Update) {
+        return Ok(());
+    }
+    let app_dirs = [env.local_app_data.clone(), env.app_data.clone()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    for dir in [&layout.root, &layout.bin] {
+        if let Some(reason) = packaged::virtualized_root_problem(dir, &app_dirs, package) {
+            return Err((
+                1,
+                format!(
+                    "refusing to {}: {reason}. Nothing was written. (Pass --allow-virtualized-root only if you know what you are doing.)",
+                    operation.name()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn run_mutation(
@@ -132,7 +173,15 @@ pub fn run_mutation(
     }
 
     let host = HostPlatform::detect().map_err(|e| (1, e))?;
-    let layout = Layout::resolve(host).map_err(|e| (1, e))?;
+    let process_env = EnvVars::from_process();
+    let layout = Layout::resolve_from(host, &process_env).map_err(|e| (1, e))?;
+    guard_virtualized_root(
+        operation,
+        parsed.allow_virtualized_root,
+        &layout,
+        &process_env,
+        &RealPackageContext,
+    )?;
     let env_mirror = std::env::var_os(MUTATION_ENV_MIRROR)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
@@ -161,6 +210,8 @@ pub fn run_mutation(
         } else {
             ""
         },
+        legacy_root: legacy::legacy_root(host, &process_env),
+        legacy_path_entries: legacy::legacy_path_entries(host, &process_env),
     };
     let services = Services {
         fetcher: fetcher.as_ref(),
@@ -246,6 +297,104 @@ mod tests {
         assert!(defaults.options.modify_path);
         assert!(defaults.options.plugins);
         assert!(!defaults.options.allow_missing_cosign);
+    }
+
+    #[test]
+    fn allow_virtualized_root_is_an_install_and_update_flag_only() {
+        let parsed = parse(
+            Operation::Install,
+            &args(&["--allow-virtualized-root"]),
+            &resolve,
+        )
+        .unwrap();
+        assert!(parsed.allow_virtualized_root);
+        assert!(
+            !parse(Operation::Update, &[], &resolve)
+                .unwrap()
+                .allow_virtualized_root
+        );
+        assert!(parse(
+            Operation::Uninstall,
+            &args(&["--allow-virtualized-root"]),
+            &resolve
+        )
+        .is_err());
+    }
+
+    fn abs(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\{}", path.replace('/', r"\")))
+        } else {
+            PathBuf::from(format!("/{path}"))
+        }
+    }
+
+    fn appdata_env() -> EnvVars {
+        EnvVars {
+            local_app_data: Some(abs("Users/t/AppData/Local")),
+            app_data: Some(abs("Users/t/AppData/Roaming")),
+            ..EnvVars::default()
+        }
+    }
+
+    fn layout_at(root: PathBuf) -> Layout {
+        Layout {
+            bin: root.join("bin"),
+            root,
+        }
+    }
+
+    #[test]
+    fn a_packaged_install_into_appdata_is_refused_unless_allowed() {
+        let packaged = packaged::FakePackage(Some("Claude_1.0_x64__abc"));
+        let layout = layout_at(abs("Users/t/AppData/Local/Sothis"));
+        for operation in [Operation::Install, Operation::Update] {
+            let (code, message) =
+                guard_virtualized_root(operation, false, &layout, &appdata_env(), &packaged)
+                    .unwrap_err();
+            assert_eq!(code, 1);
+            assert!(message.contains("Nothing was written"), "{message}");
+            assert!(message.contains("Claude_1.0_x64__abc"), "{message}");
+            assert!(message.contains("--allow-virtualized-root"), "{message}");
+        }
+        assert!(guard_virtualized_root(
+            Operation::Install,
+            true,
+            &layout,
+            &appdata_env(),
+            &packaged
+        )
+        .is_ok());
+        // Removing an old install stays possible.
+        for operation in [Operation::Uninstall, Operation::Rollback] {
+            assert!(
+                guard_virtualized_root(operation, false, &layout, &appdata_env(), &packaged)
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn the_guard_passes_for_the_profile_root_and_for_unpackaged_processes() {
+        let packaged = packaged::FakePackage(Some("Claude_1.0_x64__abc"));
+        let safe = layout_at(abs("Users/t/.sothis"));
+        assert!(guard_virtualized_root(
+            Operation::Install,
+            false,
+            &safe,
+            &appdata_env(),
+            &packaged
+        )
+        .is_ok());
+        let appdata = layout_at(abs("Users/t/AppData/Roaming/x"));
+        assert!(guard_virtualized_root(
+            Operation::Install,
+            false,
+            &appdata,
+            &appdata_env(),
+            &packaged::FakePackage(None)
+        )
+        .is_ok());
     }
 
     #[test]

@@ -28,10 +28,19 @@
     `cosign-windows-amd64` on PATH, then winget's package directory
     (%LOCALAPPDATA%\Microsoft\WinGet\Packages\Sigstore.Cosign_*).
 
-    sothis.exe is placed in %LOCALAPPDATA%\Sothis\bin (or $env:SOTHIS_HOME\bin
+    sothis.exe is placed in %USERPROFILE%\.sothis\bin (or $env:SOTHIS_HOME\bin
     when SOTHIS_HOME is set) by renaming any running copy aside, never by
     overwriting it. The script never edits PATH itself; `sothis install` does
     (unless -NoModifyPath).
+
+    Why not %LOCALAPPDATA%: the Claude desktop app is an MSIX-packaged app, and
+    Windows silently redirects writes under %LOCALAPPDATA% and %APPDATA% made by
+    its child processes into the package's private folder, while the PATH edit
+    (a registry write) is not redirected. v0.1.0 installed under
+    %LOCALAPPDATA%\Sothis and broke when run from Claude Code. %USERPROFILE%\.sothis
+    (like .cargo and .bun) is not virtualized. This script refuses to place
+    sothis under AppData while running inside a package container unless
+    -AllowVirtualizedRoot is given.
 
     This script never calls `exit` when it is piped to iex or dot-sourced, so it
     cannot close your terminal. It sets $LASTEXITCODE and throws on failure. It
@@ -56,6 +65,11 @@
 .PARAMETER NoPlugins
     Passed to `sothis install`: do not install Claude Code plugins.
 
+.PARAMETER AllowVirtualizedRoot
+    Proceed even when running inside an MSIX package container and SOTHIS_HOME
+    is under %LOCALAPPDATA% or %APPDATA% (the install would be invisible to
+    other programs). Also passed to `sothis install`.
+
 .NOTES
     Environment: SOTHIS_HOME, SOTHIS_COSIGN, SOTHIS_BOOTSTRAP_MIRROR
     (`<dir>\Davidb3l\Sothis\v<version>\<asset>` instead of GitHub; tests and
@@ -74,7 +88,8 @@ function Install-Sothis {
         [switch]$NoInstall,
         [switch]$AllowMissingCosign,
         [switch]$NoModifyPath,
-        [switch]$NoPlugins
+        [switch]$NoPlugins,
+        [switch]$AllowVirtualizedRoot
     )
 
     Set-StrictMode -Version Latest
@@ -142,6 +157,37 @@ function Install-Sothis {
             ExitCode = $process.ExitCode
             Stdout   = $stdout.Result
             Stderr   = $stderr.Result
+        }
+    }
+
+    # The MSIX package full name when this process runs inside a package
+    # container (GetCurrentPackageFullName), else $null. SOTHIS_ASSUME_PACKAGE
+    # fakes a package (tests); it can only make the check stricter.
+    function Get-PackageName {
+        if (-not [string]::IsNullOrEmpty($env:SOTHIS_ASSUME_PACKAGE)) { return $env:SOTHIS_ASSUME_PACKAGE }
+        try {
+            if (-not ('SothisPackageProbe' -as [type])) {
+                Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class SothisPackageProbe {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetCurrentPackageFullName(ref int length, StringBuilder name);
+    public static string Name() {
+        int length = 0;
+        int status = GetCurrentPackageFullName(ref length, null);
+        if (status != 0 && status != 122) { return null; }
+        StringBuilder name = new StringBuilder(length + 1);
+        status = GetCurrentPackageFullName(ref length, name);
+        return status == 0 ? name.ToString() : null;
+    }
+}
+'@
+            }
+            return [SothisPackageProbe]::Name()
+        } catch {
+            return $null
         }
     }
 
@@ -331,8 +377,25 @@ function Install-Sothis {
             }
             $binDir = Join-Path $env:SOTHIS_HOME 'bin'
         } else {
-            if ([string]::IsNullOrEmpty($env:LOCALAPPDATA)) { throw 'LOCALAPPDATA is not set' }
-            $binDir = Join-Path (Join-Path $env:LOCALAPPDATA 'Sothis') 'bin'
+            # Not under %LOCALAPPDATA%: see the MSIX note in the description.
+            $profileDir = $env:USERPROFILE
+            if ([string]::IsNullOrEmpty($profileDir)) { $profileDir = [Environment]::GetFolderPath('UserProfile') }
+            if ([string]::IsNullOrEmpty($profileDir)) { throw 'USERPROFILE is not set' }
+            if (-not [System.IO.Path]::IsPathRooted($profileDir)) {
+                throw ('USERPROFILE must be an absolute path (got {0})' -f $profileDir)
+            }
+            $binDir = Join-Path (Join-Path $profileDir '.sothis') 'bin'
+        }
+        if (-not $AllowVirtualizedRoot) {
+            foreach ($appDir in @($env:LOCALAPPDATA, $env:APPDATA)) {
+                if ([string]::IsNullOrEmpty($appDir)) { continue }
+                $prefix = $appDir.TrimEnd('\').ToLowerInvariant() + '\'
+                if (-not ($binDir.ToLowerInvariant() + '\').StartsWith($prefix)) { continue }
+                $packageName = Get-PackageName
+                if ($null -ne $packageName) {
+                    throw ("refusing to place sothis in {0}: this process runs inside the Windows app package {1}, which silently redirects writes under %LOCALAPPDATA% and %APPDATA% into the package's private folder, so the install would be invisible to other programs. Unset SOTHIS_HOME to use %USERPROFILE%\.sothis, or pass -AllowVirtualizedRoot. Nothing was installed." -f $binDir, $packageName)
+                }
+            }
         }
         [void](New-Item -ItemType Directory -Path $binDir -Force)
         $dest = Join-Path $binDir 'sothis.exe'
@@ -379,6 +442,7 @@ function Install-Sothis {
             $installArgs = @('install', '--profile', $SuiteProfile)
             if ($AllowMissingCosign) { $installArgs += '--allow-missing-cosign' }
             if ($NoModifyPath) { $installArgs += '--no-modify-path' }
+            if ($AllowVirtualizedRoot) { $installArgs += '--allow-virtualized-root' }
             if ($NoPlugins) { $installArgs += '--no-plugins' }
             Write-Note ('running: sothis ' + ($installArgs -join ' '))
             # sothis prints its own plan and results, partly on stderr. When the

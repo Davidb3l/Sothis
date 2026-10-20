@@ -8,8 +8,13 @@ use std::path::{Path, PathBuf};
 pub struct EnvVars {
     pub sothis_home: Option<PathBuf>,
     pub local_app_data: Option<PathBuf>,
+    /// `%APPDATA%` (roaming). Never a root; read so the MSIX check can name it.
+    pub app_data: Option<PathBuf>,
     pub xdg_data_home: Option<PathBuf>,
     pub home: Option<PathBuf>,
+    /// The Windows profile directory: `USERPROFILE`, else the profile
+    /// directory the OS reports. Windows' default root lives under it.
+    pub user_profile: Option<PathBuf>,
 }
 
 impl EnvVars {
@@ -22,10 +27,26 @@ impl EnvVars {
         EnvVars {
             sothis_home: var("SOTHIS_HOME"),
             local_app_data: var("LOCALAPPDATA"),
+            app_data: var("APPDATA"),
             xdg_data_home: var("XDG_DATA_HOME"),
             home: var("HOME").or_else(|| var("USERPROFILE")),
+            user_profile: var("USERPROFILE").or_else(profile_dir_from_os),
         }
     }
+}
+
+/// The profile directory according to the OS (on Windows, the profile-directory
+/// API when `USERPROFILE` is unset), for the Windows default root.
+#[cfg(windows)]
+fn profile_dir_from_os() -> Option<PathBuf> {
+    // `home_dir` consults USERPROFILE and then the profile-directory API.
+    #[allow(deprecated)]
+    std::env::home_dir().filter(|path| !path.as_os_str().is_empty())
+}
+
+#[cfg(not(windows))]
+fn profile_dir_from_os() -> Option<PathBuf> {
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,29 +82,51 @@ impl Layout {
                 root,
             });
         }
-        let bin = host.install_dir_from(env.local_app_data.clone(), env.home.clone())?;
-        let root = match host.os {
-            HostOs::Windows => bin
-                .parent()
-                .map(Path::to_path_buf)
-                .ok_or_else(|| "could not derive the Sothis root directory".to_string())?,
-            HostOs::Macos | HostOs::Linux => {
-                match env.xdg_data_home.as_ref().filter(|path| path.is_absolute()) {
-                    Some(xdg) => xdg.join("sothis"),
-                    None => env
-                        .home
-                        .clone()
-                        .ok_or_else(|| "HOME is not set".to_string())?
-                        .join(".local")
-                        .join("share")
-                        .join("sothis"),
+        match host.os {
+            HostOs::Windows => {
+                // Not under %LOCALAPPDATA%: inside an MSIX-packaged app (the
+                // Claude desktop app) writes there are redirected into the
+                // package's private folder. A dot-directory in the profile
+                // is never virtualized (the same place `.cargo` and `.bun`
+                // live).
+                let profile = env
+                    .user_profile
+                    .clone()
+                    .or_else(|| env.home.clone())
+                    .ok_or_else(|| "USERPROFILE is not set".to_string())?;
+                if !profile.is_absolute() {
+                    return Err(format!(
+                        "USERPROFILE must be an absolute path (got {})",
+                        profile.display()
+                    ));
                 }
+                let root = normalize(&profile.join(".sothis"));
+                Ok(Layout {
+                    bin: root.join("bin"),
+                    root,
+                })
             }
-        };
-        Ok(Layout {
-            root: normalize(&root),
-            bin: normalize(&bin),
-        })
+            HostOs::Macos | HostOs::Linux => {
+                let home = env
+                    .home
+                    .clone()
+                    .ok_or_else(|| "HOME is not set".to_string())?;
+                if !home.is_absolute() {
+                    return Err(format!(
+                        "HOME must be an absolute path (got {})",
+                        home.display()
+                    ));
+                }
+                let root = match env.xdg_data_home.as_ref().filter(|path| path.is_absolute()) {
+                    Some(xdg) => xdg.join("sothis"),
+                    None => home.join(".local").join("share").join("sothis"),
+                };
+                Ok(Layout {
+                    root: normalize(&root),
+                    bin: normalize(&home.join(".local").join("bin")),
+                })
+            }
+        }
     }
 
     pub fn tools_dir(&self) -> PathBuf {
@@ -156,14 +199,37 @@ mod tests {
     }
 
     #[test]
-    fn windows_default_is_localappdata_sothis() {
+    fn windows_default_is_dot_sothis_in_the_profile_not_appdata() {
         let env = EnvVars {
+            user_profile: Some(abs("Users/t")),
             local_app_data: Some(abs("Users/t/AppData/Local")),
+            app_data: Some(abs("Users/t/AppData/Roaming")),
             ..EnvVars::default()
         };
         let layout = Layout::resolve_from(host(HostOs::Windows), &env).unwrap();
-        assert_eq!(layout.root, abs("Users/t/AppData/Local").join("Sothis"));
-        assert_eq!(layout.bin, layout.root.join("bin"));
+        assert_eq!(layout.root, abs("Users/t").join(".sothis"));
+        assert_eq!(layout.bin, abs("Users/t").join(".sothis").join("bin"));
+        assert!(!layout.root.starts_with(abs("Users/t/AppData")));
+    }
+
+    #[test]
+    fn windows_default_falls_back_to_home_and_requires_an_absolute_profile() {
+        let env = EnvVars {
+            home: Some(abs("Users/h")),
+            ..EnvVars::default()
+        };
+        let layout = Layout::resolve_from(host(HostOs::Windows), &env).unwrap();
+        assert_eq!(layout.root, abs("Users/h").join(".sothis"));
+
+        let env = EnvVars {
+            user_profile: Some(PathBuf::from("relative")),
+            ..EnvVars::default()
+        };
+        let error = Layout::resolve_from(host(HostOs::Windows), &env).unwrap_err();
+        assert!(
+            error.contains("USERPROFILE must be an absolute path"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -205,8 +271,10 @@ mod tests {
             let env = EnvVars {
                 sothis_home: Some(abs("scratch/home")),
                 local_app_data: Some(abs("ignored")),
+                app_data: Some(abs("ignored")),
                 home: Some(abs("ignored")),
                 xdg_data_home: Some(abs("ignored")),
+                user_profile: Some(abs("ignored")),
             };
             let layout = Layout::resolve_from(host(os), &env).unwrap();
             assert_eq!(layout.root, abs("scratch/home"));
@@ -234,6 +302,15 @@ mod tests {
         };
         let error = Layout::resolve_from(host(HostOs::Linux), &env).unwrap_err();
         assert!(error.contains("SOTHIS_HOME must be an absolute path"));
+    }
+
+    #[test]
+    fn unix_roots_must_be_absolute() {
+        let env = EnvVars {
+            home: Some(PathBuf::from("relative")),
+            ..EnvVars::default()
+        };
+        assert!(Layout::resolve_from(host(HostOs::Linux), &env).is_err());
     }
 
     #[test]

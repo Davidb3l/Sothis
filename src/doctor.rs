@@ -1,4 +1,6 @@
-use crate::install::layout::Layout;
+use crate::install::layout::{EnvVars, Layout};
+use crate::install::legacy;
+use crate::install::packaged::{self, PackageContext, RealPackageContext};
 use crate::install::pathenv;
 use crate::install::proc::{self, describe_spawn_error};
 use crate::install::receipt;
@@ -99,6 +101,12 @@ pub struct Env {
     pub layout: Option<Layout>,
     /// Claude Code's plugin state directory.
     pub plugins_dir: Option<PathBuf>,
+    /// `%LOCALAPPDATA%` and `%APPDATA%`: what an MSIX container virtualizes.
+    pub app_dirs: Vec<PathBuf>,
+    /// The MSIX package full name when this process runs inside a package.
+    pub package_name: Option<String>,
+    /// The v0.1.0 root (`%LOCALAPPDATA%\Sothis`), Windows only.
+    pub legacy_root: Option<PathBuf>,
 }
 
 impl Env {
@@ -108,14 +116,20 @@ impl Env {
             .filter_map(std::env::var_os)
             .map(PathBuf::from)
             .find(|path| path.is_absolute());
+        let vars = EnvVars::from_process();
+        let host = crate::platform::HostPlatform::detect().ok();
         Env {
             path_dirs: process_path_dirs(),
             cwd: std::env::current_dir().unwrap_or_default(),
             home,
-            layout: crate::platform::HostPlatform::detect()
-                .ok()
-                .and_then(|host| Layout::resolve(host).ok()),
+            layout: host.and_then(|host| Layout::resolve_from(host, &vars).ok()),
             plugins_dir: claude_plugins_dir(),
+            app_dirs: [vars.local_app_data.clone(), vars.app_data.clone()]
+                .into_iter()
+                .flatten()
+                .collect(),
+            package_name: RealPackageContext.package_full_name(),
+            legacy_root: host.and_then(|host| legacy::legacy_root(host, &vars)),
         }
     }
 }
@@ -196,6 +210,8 @@ pub fn run_with(
         }
     }
     checks.extend(check_receipts(env));
+    checks.extend(check_legacy_root(env));
+    checks.extend(check_package_context(env));
     if includes_sirius {
         checks.push(check_sirius_contracts(env));
     }
@@ -657,6 +673,61 @@ fn check_receipts(env: &Env) -> Option<Check> {
     } else {
         Check::warn(NAME.to_string(), problems.join(" | "))
     })
+}
+
+/// A v0.1.0 install at the old `%LOCALAPPDATA%\Sothis` root. Advisory: it is
+/// never adopted or deleted, but it keeps copies of the tools that nothing on
+/// PATH reaches any more.
+fn check_legacy_root(env: &Env) -> Option<Check> {
+    let (legacy_root, layout) = (env.legacy_root.as_ref()?, env.layout.as_ref()?);
+    if pathenv::same_dir(legacy_root, &layout.root) || !legacy::receipts_present(legacy_root) {
+        return None;
+    }
+    Some(Check::warn(
+        "legacy_root".to_string(),
+        legacy::note(legacy_root, &layout.root),
+    ))
+}
+
+/// A process known to be packaged, for [`packaged::virtualized_root_problem`].
+struct KnownPackage<'a>(&'a str);
+
+impl PackageContext for KnownPackage<'_> {
+    fn package_full_name(&self) -> Option<String> {
+        Some(self.0.to_string())
+    }
+}
+
+/// MSIX awareness: say when this process is packaged, and fail when the
+/// effective root would be silently virtualized (new writes under AppData go
+/// to the package's private folder while the registry PATH edit does not).
+fn check_package_context(env: &Env) -> Vec<Check> {
+    let Some(name) = &env.package_name else {
+        return Vec::new();
+    };
+    let mut checks = vec![Check::pass(
+        "msix_package".to_string(),
+        format!(
+            "this process runs inside the Windows app package {name}; writes under %LOCALAPPDATA% and %APPDATA% are redirected into the package's private folder"
+        ),
+    )];
+    if let Some(layout) = &env.layout {
+        let package = KnownPackage(name);
+        let problem = [&layout.root, &layout.bin]
+            .into_iter()
+            .find_map(|dir| packaged::virtualized_root_problem(dir, &env.app_dirs, &package));
+        checks.push(match problem {
+            Some(reason) => Check::fail("root_not_virtualized".to_string(), reason),
+            None => Check::pass(
+                "root_not_virtualized".to_string(),
+                format!(
+                    "the Sothis root {} is outside %LOCALAPPDATA% and %APPDATA%, so it is not virtualized",
+                    layout.root.display()
+                ),
+            ),
+        });
+    }
+    checks
 }
 
 // ----------------------------------------------------------------------- tools
@@ -1159,7 +1230,119 @@ mod tests {
             home: None,
             layout: None,
             plugins_dir: None,
+            app_dirs: Vec::new(),
+            package_name: None,
+            legacy_root: None,
         }
+    }
+
+    fn abs_path(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\{}", path.replace('/', r"\")))
+        } else {
+            PathBuf::from(format!("/{path}"))
+        }
+    }
+
+    fn packaged_env(dir: &TempDir, root: PathBuf) -> Env {
+        let mut env = env_in(dir);
+        env.package_name = Some("Claude_1.0.0.0_x64__abc".to_string());
+        env.app_dirs = vec![
+            abs_path("Users/t/AppData/Local"),
+            abs_path("Users/t/AppData/Roaming"),
+        ];
+        env.layout = Some(Layout {
+            bin: root.join("bin"),
+            root,
+        });
+        env
+    }
+
+    #[test]
+    fn nothing_is_reported_about_packages_when_not_packaged() {
+        let dir = TempDir::new("doctor-unpackaged");
+        let mut env = env_in(&dir);
+        env.app_dirs = vec![abs_path("Users/t/AppData/Local")];
+        env.layout = Some(Layout {
+            root: abs_path("Users/t/AppData/Local/Sothis"),
+            bin: abs_path("Users/t/AppData/Local/Sothis/bin"),
+        });
+        assert!(check_package_context(&env).is_empty());
+    }
+
+    #[test]
+    fn a_packaged_process_with_an_appdata_root_fails_root_not_virtualized() {
+        let dir = TempDir::new("doctor-virtualized");
+        let env = packaged_env(&dir, abs_path("Users/t/AppData/Local/Sothis"));
+        let checks = check_package_context(&env);
+        let info = checks.iter().find(|c| c.name == "msix_package").unwrap();
+        assert_eq!(info.status, CheckStatus::Pass);
+        assert!(info.detail.contains("Claude_1.0.0.0_x64__abc"));
+        let check = checks
+            .iter()
+            .find(|c| c.name == "root_not_virtualized")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(
+            check.detail.contains("unset SOTHIS_HOME"),
+            "{}",
+            check.detail
+        );
+        assert!(!check.ok());
+    }
+
+    #[test]
+    fn a_sothis_home_override_under_appdata_also_fails_while_packaged() {
+        let dir = TempDir::new("doctor-virtualized-home");
+        let env = packaged_env(&dir, abs_path("Users/t/AppData/Roaming/trial"));
+        let checks = check_package_context(&env);
+        assert!(checks
+            .iter()
+            .any(|c| c.name == "root_not_virtualized" && c.status == CheckStatus::Fail));
+    }
+
+    #[test]
+    fn a_packaged_process_with_the_profile_root_passes() {
+        let dir = TempDir::new("doctor-profile-root");
+        let env = packaged_env(&dir, abs_path("Users/t/.sothis"));
+        let checks = check_package_context(&env);
+        let check = checks
+            .iter()
+            .find(|c| c.name == "root_not_virtualized")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
+    }
+
+    #[test]
+    fn legacy_receipts_warn_without_touching_anything() {
+        let dir = TempDir::new("doctor-legacy");
+        let legacy_root = dir.path().join("local").join("Sothis");
+        let mut env = env_in(&dir);
+        env.legacy_root = Some(legacy_root.clone());
+        env.layout = Some(Layout {
+            root: dir.path().join(".sothis"),
+            bin: dir.path().join(".sothis").join("bin"),
+        });
+        assert!(check_legacy_root(&env).is_none(), "no legacy install yet");
+        let receipts = legacy_root.join("state").join("receipts");
+        fs::create_dir_all(&receipts).unwrap();
+        assert!(
+            check_legacy_root(&env).is_none(),
+            "an empty directory is nothing"
+        );
+        fs::write(receipts.join("amt.json"), "{}").unwrap();
+        let check = check_legacy_root(&env).unwrap();
+        assert_eq!(check.name, "legacy_root");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.ok(), "a warning never fails the doctor");
+        assert!(check.detail.contains("sothis uninstall --profile"));
+        assert!(receipts.join("amt.json").is_file(), "nothing is deleted");
+        // The legacy root being the effective root (SOTHIS_HOME) is not legacy.
+        env.layout = Some(Layout {
+            root: legacy_root.clone(),
+            bin: legacy_root.join("bin"),
+        });
+        assert!(check_legacy_root(&env).is_none());
     }
 
     /// A runnable fake command: a `.cmd` on Windows (which exercises the
