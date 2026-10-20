@@ -307,10 +307,13 @@ pub fn update_plugin(target: &UpdateTarget, claude: &dyn ClaudeCli) -> StepResul
     let id = target.id();
     match claude.run(&["plugin", "update", &id]) {
         Ok(output) => {
+            // The CLI prints a "Checking for updates…" preamble first and its
+            // verdict ("✔ … updated …" / "… already at the latest version")
+            // last: report the verdict.
             let line = output
                 .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
+                .map(|line| line.trim().trim_start_matches('✔').trim())
+                .rfind(|line| !line.is_empty())
                 .unwrap_or("")
                 .to_string();
             match classify_update_output(&output) {
@@ -616,6 +619,35 @@ mod tests {
         let step = update_plugin(&sirius_target(), &claude);
         assert!(step.failed);
         assert!(step.detail.contains("sirius@sothis"));
+    }
+
+    #[test]
+    fn update_plugin_reports_the_cli_verdict_not_its_preamble() {
+        // Real `claude plugin update` output (2026-10-20): a "Checking…"
+        // preamble line, then the verdict line.
+        let mut claude = FakeClaude::new(true);
+        claude.outputs = vec![(
+            "update sirius@sothis",
+            "Checking for updates for plugin \"sirius@sothis\"…\n✔ Plugin updated from 0.2.6 to 0.2.7\n",
+        )];
+        let step = update_plugin(&sirius_target(), &claude);
+        assert_eq!(step.result, "updated");
+        assert!(
+            step.detail.contains("Plugin updated from 0.2.6 to 0.2.7"),
+            "{}",
+            step.detail
+        );
+        assert!(!step.detail.contains("Checking"), "{}", step.detail);
+        assert!(!step.detail.contains('✔'), "{}", step.detail);
+
+        claude.outputs = vec![(
+            "update sirius@sothis",
+            "Checking for updates for plugin \"sirius@sothis\"…\n✔ sirius is already at the latest version (0.2.7).\n",
+        )];
+        assert_eq!(
+            update_plugin(&sirius_target(), &claude).result,
+            "up-to-date"
+        );
     }
 
     #[test]
