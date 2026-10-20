@@ -1,9 +1,9 @@
 use crate::install::layout::{EnvVars, Layout};
 use crate::install::legacy;
-use crate::install::packaged::{self, PackageContext, RealPackageContext};
 use crate::install::pathenv;
 use crate::install::proc::{self, describe_spawn_error};
 use crate::install::receipt;
+use crate::install::virtualized::{self, Probe, RealVirtualizationProbe, VirtualizationProbe};
 use crate::manifest::{Manifest, Tool};
 use crate::plan::{self, PlanAction};
 use semver::Version;
@@ -101,10 +101,9 @@ pub struct Env {
     pub layout: Option<Layout>,
     /// Claude Code's plugin state directory.
     pub plugins_dir: Option<PathBuf>,
-    /// `%LOCALAPPDATA%` and `%APPDATA%`: what an MSIX container virtualizes.
-    pub app_dirs: Vec<PathBuf>,
-    /// The MSIX package full name when this process runs inside a package.
-    pub package_name: Option<String>,
+    /// What probing the root (and a bin directory outside it) found; empty
+    /// where there is nothing to probe (not Windows).
+    pub root_probes: Vec<(PathBuf, Probe)>,
     /// The v0.1.0 root (`%LOCALAPPDATA%\Sothis`), Windows only.
     pub legacy_root: Option<PathBuf>,
 }
@@ -124,11 +123,13 @@ impl Env {
             home,
             layout: host.and_then(|host| Layout::resolve_from(host, &vars).ok()),
             plugins_dir: claude_plugins_dir(),
-            app_dirs: [vars.local_app_data.clone(), vars.app_data.clone()]
-                .into_iter()
-                .flatten()
-                .collect(),
-            package_name: RealPackageContext.package_full_name(),
+            root_probes: if cfg!(windows) {
+                host.and_then(|host| Layout::resolve_from(host, &vars).ok())
+                    .map(|layout| probe_roots(&layout, &RealVirtualizationProbe))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
             legacy_root: host.and_then(|host| legacy::legacy_root(host, &vars)),
         }
     }
@@ -211,7 +212,7 @@ pub fn run_with(
     }
     checks.extend(check_receipts(env));
     checks.extend(check_legacy_root(env));
-    checks.extend(check_package_context(env));
+    checks.extend(check_virtualization(env));
     if includes_sirius {
         checks.push(check_sirius_contracts(env));
     }
@@ -689,45 +690,61 @@ fn check_legacy_root(env: &Env) -> Option<Check> {
     ))
 }
 
-/// A process known to be packaged, for [`packaged::virtualized_root_problem`].
-struct KnownPackage<'a>(&'a str);
-
-impl PackageContext for KnownPackage<'_> {
-    fn package_full_name(&self) -> Option<String> {
-        Some(self.0.to_string())
-    }
+/// Probe the Sothis root (and a bin directory outside it) for file-system
+/// virtualization. Each probe creates and removes one uniquely named file in
+/// the nearest existing directory.
+fn probe_roots(layout: &Layout, probe: &dyn VirtualizationProbe) -> Vec<(PathBuf, Probe)> {
+    crate::install::cli::probe_targets(layout)
+        .into_iter()
+        .map(|dir| (dir.to_path_buf(), probe.probe(dir)))
+        .collect()
 }
 
-/// MSIX awareness: say when this process is packaged, and fail when the
-/// effective root would be silently virtualized (new writes under AppData go
-/// to the package's private folder while the registry PATH edit does not).
-fn check_package_context(env: &Env) -> Vec<Check> {
-    let Some(name) = &env.package_name else {
+/// Windows virtualizes new writes under `%LOCALAPPDATA%` and `%APPDATA%` for
+/// processes started by the Claude desktop app (they land in
+/// `...\Packages\<package>\LocalCache\...`), while the PATH registry edit is
+/// not redirected. Fail when the effective root would be virtualized.
+fn check_virtualization(env: &Env) -> Vec<Check> {
+    const NAME: &str = "root_not_virtualized";
+    if env.root_probes.is_empty() {
         return Vec::new();
-    };
-    let mut checks = vec![Check::pass(
-        "msix_package".to_string(),
-        format!(
-            "this process runs inside the Windows app package {name}; writes under %LOCALAPPDATA% and %APPDATA% are redirected into the package's private folder"
-        ),
-    )];
-    if let Some(layout) = &env.layout {
-        let package = KnownPackage(name);
-        let problem = [&layout.root, &layout.bin]
-            .into_iter()
-            .find_map(|dir| packaged::virtualized_root_problem(dir, &env.app_dirs, &package));
-        checks.push(match problem {
-            Some(reason) => Check::fail("root_not_virtualized".to_string(), reason),
-            None => Check::pass(
-                "root_not_virtualized".to_string(),
-                format!(
-                    "the Sothis root {} is outside %LOCALAPPDATA% and %APPDATA%, so it is not virtualized",
-                    layout.root.display()
-                ),
-            ),
-        });
     }
-    checks
+    for (dir, probe) in &env.root_probes {
+        if let Probe::Virtualized { package, landed } = probe {
+            return vec![Check::fail(
+                NAME.to_string(),
+                virtualized::virtualized_message(dir, package, landed),
+            )];
+        }
+    }
+    let unknown = env
+        .root_probes
+        .iter()
+        .filter_map(|(dir, probe)| match probe {
+            Probe::Unknown(why) => Some(format!("{}: {why}", dir.display())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return vec![Check::skip(
+            NAME.to_string(),
+            format!(
+                "could not probe for virtualization ({})",
+                unknown.join("; ")
+            ),
+        )];
+    }
+    vec![Check::pass(
+        NAME.to_string(),
+        format!(
+            "a probe file written under {} landed where it was written, so it is not virtualized",
+            env.root_probes
+                .iter()
+                .map(|(dir, _)| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )]
 }
 
 // ----------------------------------------------------------------------- tools
@@ -1230,8 +1247,7 @@ mod tests {
             home: None,
             layout: None,
             plugins_dir: None,
-            app_dirs: Vec::new(),
-            package_name: None,
+            root_probes: Vec::new(),
             legacy_root: None,
         }
     }
@@ -1244,45 +1260,35 @@ mod tests {
         }
     }
 
-    fn packaged_env(dir: &TempDir, root: PathBuf) -> Env {
+    fn probed_env(dir: &TempDir, root: PathBuf, probe: &dyn VirtualizationProbe) -> Env {
         let mut env = env_in(dir);
-        env.package_name = Some("Claude_1.0.0.0_x64__abc".to_string());
-        env.app_dirs = vec![
-            abs_path("Users/t/AppData/Local"),
-            abs_path("Users/t/AppData/Roaming"),
-        ];
-        env.layout = Some(Layout {
+        let layout = Layout {
             bin: root.join("bin"),
             root,
-        });
+        };
+        env.root_probes = probe_roots(&layout, probe);
+        env.layout = Some(layout);
         env
     }
 
     #[test]
-    fn nothing_is_reported_about_packages_when_not_packaged() {
-        let dir = TempDir::new("doctor-unpackaged");
-        let mut env = env_in(&dir);
-        env.app_dirs = vec![abs_path("Users/t/AppData/Local")];
-        env.layout = Some(Layout {
-            root: abs_path("Users/t/AppData/Local/Sothis"),
-            bin: abs_path("Users/t/AppData/Local/Sothis/bin"),
-        });
-        assert!(check_package_context(&env).is_empty());
+    fn nothing_is_reported_where_there_is_nothing_to_probe() {
+        let dir = TempDir::new("doctor-unprobed");
+        assert!(check_virtualization(&env_in(&dir)).is_empty());
     }
 
     #[test]
-    fn a_packaged_process_with_an_appdata_root_fails_root_not_virtualized() {
+    fn a_virtualized_appdata_root_fails_root_not_virtualized() {
         let dir = TempDir::new("doctor-virtualized");
-        let env = packaged_env(&dir, abs_path("Users/t/AppData/Local/Sothis"));
-        let checks = check_package_context(&env);
-        let info = checks.iter().find(|c| c.name == "msix_package").unwrap();
-        assert_eq!(info.status, CheckStatus::Pass);
-        assert!(info.detail.contains("Claude_1.0.0.0_x64__abc"));
-        let check = checks
-            .iter()
-            .find(|c| c.name == "root_not_virtualized")
-            .unwrap();
+        let probe =
+            virtualized::FakeProbe::virtualizing(abs_path("Users/t/AppData/Local"), "Claude_abc");
+        let env = probed_env(&dir, abs_path("Users/t/AppData/Local/Sothis"), &probe);
+        let checks = check_virtualization(&env);
+        assert_eq!(checks.len(), 1);
+        let check = &checks[0];
+        assert_eq!(check.name, "root_not_virtualized");
         assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.detail.contains("Claude_abc"), "{}", check.detail);
         assert!(
             check.detail.contains("unset SOTHIS_HOME"),
             "{}",
@@ -1292,25 +1298,30 @@ mod tests {
     }
 
     #[test]
-    fn a_sothis_home_override_under_appdata_also_fails_while_packaged() {
+    fn a_sothis_home_override_under_appdata_also_fails_when_virtualized() {
         let dir = TempDir::new("doctor-virtualized-home");
-        let env = packaged_env(&dir, abs_path("Users/t/AppData/Roaming/trial"));
-        let checks = check_package_context(&env);
-        assert!(checks
-            .iter()
-            .any(|c| c.name == "root_not_virtualized" && c.status == CheckStatus::Fail));
+        let probe = virtualized::FakeProbe::virtualizing(abs_path("Users/t/AppData"), "Claude_abc");
+        let env = probed_env(&dir, abs_path("Users/t/AppData/Roaming/trial"), &probe);
+        assert_eq!(check_virtualization(&env)[0].status, CheckStatus::Fail);
     }
 
     #[test]
-    fn a_packaged_process_with_the_profile_root_passes() {
-        let dir = TempDir::new("doctor-profile-root");
-        let env = packaged_env(&dir, abs_path("Users/t/.sothis"));
-        let checks = check_package_context(&env);
-        let check = checks
-            .iter()
-            .find(|c| c.name == "root_not_virtualized")
-            .unwrap();
+    fn a_direct_root_passes_and_an_unprobeable_one_is_skipped_not_failed() {
+        let dir = TempDir::new("doctor-direct-root");
+        let probe =
+            virtualized::FakeProbe::virtualizing(abs_path("Users/t/AppData/Local"), "Claude_abc");
+        let env = probed_env(&dir, abs_path("Users/t/.sothis"), &probe);
+        let check = &check_virtualization(&env)[0];
         assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
+
+        let unknown = virtualized::FakeProbe {
+            unknown: true,
+            ..virtualized::FakeProbe::direct()
+        };
+        let env = probed_env(&dir, abs_path("Users/t/AppData/Local/Sothis"), &unknown);
+        let check = &check_virtualization(&env)[0];
+        assert_eq!(check.status, CheckStatus::Skip);
+        assert!(check.ok());
     }
 
     #[test]

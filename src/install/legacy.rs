@@ -1,8 +1,8 @@
 //! The v0.1.0 default root, `%LOCALAPPDATA%\Sothis` (Windows only).
 //!
-//! v0.1.0 installed there, which an MSIX-packaged parent (the Claude desktop
-//! app) silently redirects into the package's private folder; see
-//! [`crate::install::packaged`]. v0.1.1 moved the default to
+//! v0.1.0 installed there, which a process started by the Claude desktop app
+//! has silently redirected into a package's private folder; see
+//! [`crate::install::virtualized`]. v0.1.1 moved the default to
 //! `%USERPROFILE%\.sothis`. A v0.1.0 install is never adopted or deleted; it is
 //! reported with the commands that remove it, and its PATH entry is migrated.
 

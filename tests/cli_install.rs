@@ -33,6 +33,10 @@ fn sothis(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sothis"))
         .args(args)
         .env("SOTHIS_HOME", home)
+        // These tests install into temp directories, which on a machine where
+        // the shell itself is virtualized (the Claude desktop app) would be
+        // refused; the refusal has its own tests.
+        .env("SOTHIS_ALLOW_VIRTUALIZED_ROOT", "1")
         .env_remove("SOTHIS_RELEASE_MIRROR")
         .env_remove("SOTHIS_COSIGN")
         .output()
@@ -339,103 +343,25 @@ fn real_release_assets_install_verify_idempotency_tamper_and_uninstall() {
     assert!(!home.join("bin").join("hayven.exe").exists());
 }
 
-// ------------------------------------------------ MSIX / virtualized roots
+// ------------------------------------------------ virtualized roots
 //
-// `SOTHIS_ASSUME_PACKAGE` makes the binary behave as if it ran inside an MSIX
-// package (it can only make the checks stricter), so the guard is exercised on
-// any machine. `LOCALAPPDATA` points at a temp directory, never the real one.
+// The refusal itself is covered with a fake probe in the unit tests (the real
+// probe needs a virtualized process). Here the real binary runs the real probe
+// against a directory under %USERPROFILE%, which is never virtualized.
 
-fn sothis_packaged(home: &Path, local_app_data: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_sothis"))
-        .args(args)
-        .env("SOTHIS_HOME", home)
-        .env("LOCALAPPDATA", local_app_data)
-        .env("SOTHIS_ASSUME_PACKAGE", "Claude_1.0.0.0_x64__test")
-        .env_remove("SOTHIS_RELEASE_MIRROR")
-        .env_remove("SOTHIS_COSIGN")
-        .output()
+#[cfg(windows)]
+fn profile_scratch(label: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
+        .as_nanos();
+    PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(format!(
+        ".sothis-cli-{label}-{}-{nonce}",
+        std::process::id()
+    ))
 }
 
-#[test]
-fn a_packaged_install_into_appdata_is_refused_and_writes_nothing() {
-    let temp = Temp::new("msix-refuse");
-    let local = temp.0.join("AppData").join("Local");
-    let home = local.join("Sothis");
-    fs::create_dir_all(&local).unwrap();
-    for command in ["install", "update"] {
-        let output = sothis_packaged(
-            &home,
-            &local,
-            &[
-                command,
-                "--profile",
-                "core",
-                "--no-modify-path",
-                "--no-plugins",
-            ],
-        );
-        assert_eq!(output.status.code(), Some(1), "{command}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(&format!("refusing to {command}")),
-            "{stderr}"
-        );
-        assert!(stderr.contains("Nothing was written"), "{stderr}");
-        assert!(stderr.contains("--allow-virtualized-root"), "{stderr}");
-        assert!(!home.exists(), "{command} must not create the root");
-    }
-}
-
-#[test]
-fn allow_virtualized_root_gets_past_the_guard() {
-    let temp = Temp::new("msix-allow");
-    let local = temp.0.join("AppData").join("Local");
-    let home = local.join("Sothis");
-    let mirror = temp.0.join("mirror");
-    fs::create_dir_all(&mirror).unwrap();
-    let output = sothis_packaged(
-        &home,
-        &local,
-        &[
-            "install",
-            "--profile",
-            "core",
-            "--no-modify-path",
-            "--no-plugins",
-            "--allow-virtualized-root",
-            "--mirror",
-            mirror.to_str().unwrap(),
-        ],
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains("refusing to install"), "{stderr}");
-}
-
-#[test]
-fn a_packaged_root_outside_appdata_is_not_refused() {
-    let temp = Temp::new("msix-profile");
-    let local = temp.0.join("AppData").join("Local");
-    let home = temp.0.join(".sothis");
-    let mirror = temp.0.join("mirror");
-    fs::create_dir_all(&mirror).unwrap();
-    let output = sothis_packaged(
-        &home,
-        &local,
-        &[
-            "install",
-            "--profile",
-            "core",
-            "--no-modify-path",
-            "--no-plugins",
-            "--mirror",
-            mirror.to_str().unwrap(),
-        ],
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains("refusing to install"), "{stderr}");
-}
-
+#[cfg(windows)]
 fn check<'a>(report: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
     report["checks"]
         .as_array()?
@@ -443,54 +369,58 @@ fn check<'a>(report: &'a serde_json::Value, name: &str) -> Option<&'a serde_json
         .find(|check| check["name"] == name)
 }
 
+#[cfg(windows)]
 #[test]
-fn doctor_fails_root_not_virtualized_for_a_packaged_appdata_root() {
-    let temp = Temp::new("msix-doctor-fail");
-    let local = temp.0.join("AppData").join("Local");
-    let home = local.join("Sothis");
-    fs::create_dir_all(&local).unwrap();
-    let output = sothis_packaged(&home, &local, &["doctor", "--profile", "bell", "--json"]);
-    assert_eq!(output.status.code(), Some(1));
-    let report = json(&output);
-    assert_eq!(report["ok"], false);
-    let info = check(&report, "msix_package").expect("the package line");
-    assert!(info["detail"]
-        .as_str()
-        .unwrap()
-        .contains("Claude_1.0.0.0_x64__test"));
-    let failed = check(&report, "root_not_virtualized").expect("the root check");
-    assert_eq!(failed["status"], "fail");
-    assert!(!home.exists(), "doctor writes nothing");
-}
-
-#[test]
-fn doctor_passes_root_not_virtualized_for_a_profile_root_and_is_silent_when_unpackaged() {
-    let temp = Temp::new("msix-doctor-pass");
-    let local = temp.0.join("AppData").join("Local");
-    let home = temp.0.join(".sothis");
-    let output = sothis_packaged(&home, &local, &["doctor", "--profile", "bell", "--json"]);
-    assert_eq!(output.status.code(), Some(0));
-    let report = json(&output);
-    assert_eq!(
-        check(&report, "root_not_virtualized").unwrap()["status"],
-        "pass"
-    );
-
-    // Unpackaged: no package line, no virtualization verdict, even under AppData.
-    let plain = Command::new(env!("CARGO_BIN_EXE_sothis"))
+fn doctor_probes_a_profile_root_and_passes_root_not_virtualized() {
+    let home = profile_scratch("doctor");
+    let output = Command::new(env!("CARGO_BIN_EXE_sothis"))
         .args(["doctor", "--profile", "bell", "--json"])
-        .env("SOTHIS_HOME", local.join("Sothis"))
-        .env("LOCALAPPDATA", &local)
-        .env_remove("SOTHIS_ASSUME_PACKAGE")
+        .env("SOTHIS_HOME", &home)
         .output()
         .unwrap();
-    if plain.status.code() == Some(0) {
-        let report = json(&plain);
-        if cfg!(not(windows)) {
-            assert!(check(&report, "msix_package").is_none());
-            assert!(check(&report, "root_not_virtualized").is_none());
-        }
-    }
+    let existed = home.exists();
+    let report = json(&output);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(
+        check(&report, "root_not_virtualized").expect("the probe check")["status"],
+        "pass"
+    );
+    assert!(
+        !existed,
+        "doctor probes through an ancestor and creates no root"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn an_install_into_a_profile_root_is_not_refused_without_any_allow_flag() {
+    let home = profile_scratch("install");
+    let mirror = home.with_extension("mirror");
+    fs::create_dir_all(&mirror).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sothis"))
+        .args([
+            "install",
+            "--profile",
+            "core",
+            "--no-modify-path",
+            "--no-plugins",
+            "--mirror",
+            mirror.to_str().unwrap(),
+        ])
+        .env("SOTHIS_HOME", &home)
+        .env_remove("SOTHIS_ALLOW_VIRTUALIZED_ROOT")
+        .env_remove("SOTHIS_RELEASE_MIRROR")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&mirror);
+    assert!(!text.contains("refusing to install"), "{text}");
+    assert!(text.contains("missing from the mirror"), "{text}");
 }
 
 #[cfg(windows)]

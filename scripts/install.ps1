@@ -33,14 +33,17 @@
     overwriting it. The script never edits PATH itself; `sothis install` does
     (unless -NoModifyPath).
 
-    Why not %LOCALAPPDATA%: the Claude desktop app is an MSIX-packaged app, and
-    Windows silently redirects writes under %LOCALAPPDATA% and %APPDATA% made by
-    its child processes into the package's private folder, while the PATH edit
-    (a registry write) is not redirected. v0.1.0 installed under
-    %LOCALAPPDATA%\Sothis and broke when run from Claude Code. %USERPROFILE%\.sothis
-    (like .cargo and .bun) is not virtualized. This script refuses to place
-    sothis under AppData while running inside a package container unless
-    -AllowVirtualizedRoot is given.
+    Why not %LOCALAPPDATA%: processes started by the Claude desktop app have
+    their new writes under %LOCALAPPDATA% and %APPDATA% silently redirected into
+    %LOCALAPPDATA%\Packages\<package>\LocalCache\..., even though they have no
+    package identity, while the PATH edit (a registry write) is not redirected.
+    v0.1.0 installed under %LOCALAPPDATA%\Sothis and broke when run from Claude
+    Code. %USERPROFILE%\.sothis (like .cargo and .bun) is not virtualized. When
+    the target is under %LOCALAPPDATA% or %APPDATA%, this script writes a probe
+    file there, asks Windows where the open handle really lives
+    (GetFinalPathNameByHandle) and deletes it; if the file landed in a
+    Packages\...\LocalCache folder it refuses, unless -AllowVirtualizedRoot (or
+    SOTHIS_ALLOW_VIRTUALIZED_ROOT=1) is given.
 
     This script never calls `exit` when it is piped to iex or dot-sourced, so it
     cannot close your terminal. It sets $LASTEXITCODE and throws on failure. It
@@ -66,9 +69,9 @@
     Passed to `sothis install`: do not install Claude Code plugins.
 
 .PARAMETER AllowVirtualizedRoot
-    Proceed even when running inside an MSIX package container and SOTHIS_HOME
-    is under %LOCALAPPDATA% or %APPDATA% (the install would be invisible to
-    other programs). Also passed to `sothis install`.
+    Proceed even when the target directory is virtualized (the install would be
+    invisible to other programs). Also passed to `sothis install`. The
+    environment variable SOTHIS_ALLOW_VIRTUALIZED_ROOT=1 does the same.
 
 .NOTES
     Environment: SOTHIS_HOME, SOTHIS_COSIGN, SOTHIS_BOOTSTRAP_MIRROR
@@ -160,32 +163,49 @@ function Install-Sothis {
         }
     }
 
-    # The MSIX package full name when this process runs inside a package
-    # container (GetCurrentPackageFullName), else $null. SOTHIS_ASSUME_PACKAGE
-    # fakes a package (tests); it can only make the check stricter.
-    function Get-PackageName {
-        if (-not [string]::IsNullOrEmpty($env:SOTHIS_ASSUME_PACKAGE)) { return $env:SOTHIS_ASSUME_PACKAGE }
+    # Where does a new file written to $Directory really land? Returns a message
+    # when Windows redirected a probe file into a Packages\<name>\LocalCache
+    # folder (file-system virtualization, as for processes started by the Claude
+    # desktop app), else $null. A probe that cannot be completed is "unknown",
+    # which is $null too: never a refusal.
+    function Get-VirtualizationProblem([string]$Directory) {
         try {
-            if (-not ('SothisPackageProbe' -as [type])) {
+            if (-not ('SothisFinalPath' -as [type])) {
                 Add-Type -TypeDefinition @'
 using System;
 using System.Text;
 using System.Runtime.InteropServices;
-public static class SothisPackageProbe {
+public static class SothisFinalPath {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-    private static extern int GetCurrentPackageFullName(ref int length, StringBuilder name);
-    public static string Name() {
-        int length = 0;
-        int status = GetCurrentPackageFullName(ref length, null);
-        if (status != 0 && status != 122) { return null; }
-        StringBuilder name = new StringBuilder(length + 1);
-        status = GetCurrentPackageFullName(ref length, name);
-        return status == 0 ? name.ToString() : null;
+    private static extern uint GetFinalPathNameByHandleW(IntPtr handle, StringBuilder path, uint length, uint flags);
+    public static string Of(IntPtr handle) {
+        StringBuilder path = new StringBuilder(1024);
+        uint n = GetFinalPathNameByHandleW(handle, path, (uint)path.Capacity, 0);
+        if (n == 0 || n >= path.Capacity) { return null; }
+        return path.ToString();
     }
 }
 '@
             }
-            return [SothisPackageProbe]::Name()
+            $target = $Directory
+            while ((-not [string]::IsNullOrEmpty($target)) -and (-not (Test-Path -LiteralPath $target -PathType Container))) {
+                $target = Split-Path -Parent $target
+            }
+            if ([string]::IsNullOrEmpty($target)) { return $null }
+            $probe = Join-Path $target ('.sothis-probe-{0}-{1}' -f $PID, [Guid]::NewGuid().ToString('N'))
+            $stream = New-Object System.IO.FileStream($probe, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            try {
+                $final = [SothisFinalPath]::Of($stream.SafeFileHandle.DangerousGetHandle())
+            } finally {
+                $stream.Dispose()
+                Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+            }
+            if ([string]::IsNullOrEmpty($final)) { return $null }
+            if ($final.StartsWith('\\?\')) { $final = $final.Substring(4) }
+            if ($final -ieq $probe) { return $null }
+            $found = [regex]::Match($final, '(?i)\\Packages\\([^\\]+)\\LocalCache\\')
+            if (-not $found.Success) { return $null }
+            return ("Windows redirected a test file written to {0} into {1} (package folder {2}): this process is virtualized (for example it was started by the Claude desktop app), so new writes under %LOCALAPPDATA% and %APPDATA% go to a private folder that other programs cannot see, while the PATH registry edit is not redirected." -f $target, $final, $found.Groups[1].Value)
         } catch {
             return $null
         }
@@ -377,7 +397,7 @@ public static class SothisPackageProbe {
             }
             $binDir = Join-Path $env:SOTHIS_HOME 'bin'
         } else {
-            # Not under %LOCALAPPDATA%: see the MSIX note in the description.
+            # Not under %LOCALAPPDATA%: see the note in the description.
             $profileDir = $env:USERPROFILE
             if ([string]::IsNullOrEmpty($profileDir)) { $profileDir = [Environment]::GetFolderPath('UserProfile') }
             if ([string]::IsNullOrEmpty($profileDir)) { throw 'USERPROFILE is not set' }
@@ -386,15 +406,19 @@ public static class SothisPackageProbe {
             }
             $binDir = Join-Path (Join-Path $profileDir '.sothis') 'bin'
         }
-        if (-not $AllowVirtualizedRoot) {
+        $allowVirtualized = $AllowVirtualizedRoot -or (-not [string]::IsNullOrEmpty($env:SOTHIS_ALLOW_VIRTUALIZED_ROOT))
+        if (-not $allowVirtualized) {
+            # Only AppData is ever virtualized, so the default (under the
+            # profile, outside AppData) never needs the probe.
             foreach ($appDir in @($env:LOCALAPPDATA, $env:APPDATA)) {
                 if ([string]::IsNullOrEmpty($appDir)) { continue }
                 $prefix = $appDir.TrimEnd('\').ToLowerInvariant() + '\'
                 if (-not ($binDir.ToLowerInvariant() + '\').StartsWith($prefix)) { continue }
-                $packageName = Get-PackageName
-                if ($null -ne $packageName) {
-                    throw ("refusing to place sothis in {0}: this process runs inside the Windows app package {1}, which silently redirects writes under %LOCALAPPDATA% and %APPDATA% into the package's private folder, so the install would be invisible to other programs. Unset SOTHIS_HOME to use %USERPROFILE%\.sothis, or pass -AllowVirtualizedRoot. Nothing was installed." -f $binDir, $packageName)
+                $problem = Get-VirtualizationProblem $binDir
+                if ($null -ne $problem) {
+                    throw ("refusing to place sothis in {0}: {1} Use a root outside AppData: unset SOTHIS_HOME to use %USERPROFILE%\.sothis, or pass -AllowVirtualizedRoot. Nothing was installed." -f $binDir, $problem)
                 }
+                break
             }
         }
         [void](New-Item -ItemType Directory -Path $binDir -Force)

@@ -14,7 +14,7 @@
 #                           fatal). Also passed to `sothis install`.
 #   --no-modify-path        Passed to `sothis install`
 #   --no-plugins            Passed to `sothis install`
-#   --allow-virtualized-root  Passed to `sothis install` (see the MSIX note below)
+#   --allow-virtualized-root  Passed to `sothis install` (see the note below)
 #   -h, --help              This text
 #
 # What it verifies, in order, before anything is unpacked: the download's
@@ -24,8 +24,8 @@
 #
 # Where sothis goes (the same directory `sothis env` reports):
 #   Windows (Git Bash/MSYS)  %USERPROFILE%\.sothis\bin
-#                            (not %LOCALAPPDATA%: the Claude desktop app is MSIX-packaged and
-#                            redirects its children's writes under AppData into a private
+#                            (not %LOCALAPPDATA%: processes started by the Claude desktop app
+#                            have their writes under AppData redirected into a private
 #                            folder, so an install there is invisible to everything else)
 #   $SOTHIS_HOME set         $SOTHIS_HOME/bin
 #   macOS / Linux            ~/.local/bin

@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 pub struct EnvVars {
     pub sothis_home: Option<PathBuf>,
     pub local_app_data: Option<PathBuf>,
-    /// `%APPDATA%` (roaming). Never a root; read so the MSIX check can name it.
-    pub app_data: Option<PathBuf>,
     pub xdg_data_home: Option<PathBuf>,
     pub home: Option<PathBuf>,
     /// The Windows profile directory: `USERPROFILE`, else the profile
@@ -27,7 +25,6 @@ impl EnvVars {
         EnvVars {
             sothis_home: var("SOTHIS_HOME"),
             local_app_data: var("LOCALAPPDATA"),
-            app_data: var("APPDATA"),
             xdg_data_home: var("XDG_DATA_HOME"),
             home: var("HOME").or_else(|| var("USERPROFILE")),
             user_profile: var("USERPROFILE").or_else(profile_dir_from_os),
@@ -84,11 +81,10 @@ impl Layout {
         }
         match host.os {
             HostOs::Windows => {
-                // Not under %LOCALAPPDATA%: inside an MSIX-packaged app (the
-                // Claude desktop app) writes there are redirected into the
-                // package's private folder. A dot-directory in the profile
-                // is never virtualized (the same place `.cargo` and `.bun`
-                // live).
+                // Not under %LOCALAPPDATA%: processes started by the Claude
+                // desktop app have their new writes there redirected into a
+                // package's private folder. A dot-directory in the profile is
+                // not virtualized (the same place `.cargo` and `.bun` live).
                 let profile = env
                     .user_profile
                     .clone()
@@ -203,7 +199,6 @@ mod tests {
         let env = EnvVars {
             user_profile: Some(abs("Users/t")),
             local_app_data: Some(abs("Users/t/AppData/Local")),
-            app_data: Some(abs("Users/t/AppData/Roaming")),
             ..EnvVars::default()
         };
         let layout = Layout::resolve_from(host(HostOs::Windows), &env).unwrap();
@@ -271,7 +266,6 @@ mod tests {
             let env = EnvVars {
                 sothis_home: Some(abs("scratch/home")),
                 local_app_data: Some(abs("ignored")),
-                app_data: Some(abs("ignored")),
                 home: Some(abs("ignored")),
                 xdg_data_home: Some(abs("ignored")),
                 user_profile: Some(abs("ignored")),

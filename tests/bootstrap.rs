@@ -245,6 +245,10 @@ fn env_for(command: &mut Command, setup: &Setup<'_>, slash: bool) {
     let (platform, _) = platform();
     command
         .env("SOTHIS_HOME", text(setup.home))
+        // The temp homes below can sit under AppData, which is virtualized when
+        // the shell was started by the Claude desktop app; these scenarios are
+        // not about that (the refusal has its own test).
+        .env("SOTHIS_ALLOW_VIRTUALIZED_ROOT", "1")
         .env("SOTHIS_BOOTSTRAP_MIRROR", text(&setup.release.mirror))
         .env("SOTHIS_BOOTSTRAP_PLATFORM", platform)
         .env_remove("SOTHIS_RELEASE_MIRROR");
@@ -727,8 +731,8 @@ fn ps1_usage_errors_exit_one_with_a_message() {
 
 // ---------------------------------------------------------------------------
 // Default root (no SOTHIS_HOME): %USERPROFILE%\.sothis on Windows, ~/.local/bin
-// elsewhere. Never %LOCALAPPDATA%: an MSIX-packaged parent (the Claude desktop
-// app) silently redirects its children's writes there.
+// elsewhere. Never %LOCALAPPDATA%: processes started by the Claude desktop
+// app have their writes there silently redirected.
 //
 // SAFETY: USERPROFILE/HOME/LOCALAPPDATA/APPDATA all point into a temp dir.
 
@@ -754,7 +758,7 @@ fn default_root_env(
     let (platform, _) = platform();
     command
         .env_remove("SOTHIS_HOME")
-        .env_remove("SOTHIS_ASSUME_PACKAGE")
+        .env_remove("SOTHIS_ALLOW_VIRTUALIZED_ROOT")
         .env_remove("SOTHIS_RELEASE_MIRROR")
         .env("USERPROFILE", text(&dirs.profile))
         .env("HOME", text(&dirs.profile))
@@ -859,10 +863,15 @@ fn ps1_default_root_is_the_profile_not_appdata() {
     );
 }
 
+/// The real probe, end to end: a root under the real `%LOCALAPPDATA%` is
+/// placed when that directory is not virtualized, and refused (nothing
+/// installed) when it is, e.g. in a shell started by the Claude desktop app.
+/// `-AllowVirtualizedRoot` always places it. The scratch directory is uniquely
+/// named and deleted.
 #[cfg(windows)]
 #[test]
-fn ps1_refuses_an_appdata_root_inside_a_package_unless_allowed() {
-    let temp = Temp::new("ps1-msix");
+fn ps1_probes_an_appdata_root_and_refuses_only_a_virtualized_one() {
+    let temp = Temp::new("ps1-probe");
     let release = make_release(&temp.0);
     release.add_bundle();
     let cosign = fake_cosign(&temp.0.join("cosign"), true, true);
@@ -870,40 +879,48 @@ fn ps1_refuses_an_appdata_root_inside_a_package_unless_allowed() {
         profile: temp.0.join("profile"),
         local: temp.0.join("profile").join("AppData").join("Local"),
     };
-    fs::create_dir_all(&dirs.local).unwrap();
-    let home = dirs.local.join("Sothis");
-    let mut refused = ps1_command(
-        &release,
-        &cosign,
-        &dirs,
-        &["-Version", VERSION, "-NoInstall"],
-    );
-    refused
-        .env("SOTHIS_HOME", &home)
-        .env("SOTHIS_ASSUME_PACKAGE", "Claude_1.0.0.0_x64__test");
-    let run = Run {
-        output: refused.output().unwrap(),
+    let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+    let home = local.join(format!(
+        "sothis-bootstrap-probe-{}-{}",
+        std::process::id(),
+        temp.0.file_name().unwrap().to_string_lossy()
+    ));
+    let probe_run = |args: &[&str]| {
+        let mut command = ps1_command(&release, &cosign, &dirs, args);
+        command
+            .env("SOTHIS_HOME", &home)
+            .env("LOCALAPPDATA", &local)
+            .env("APPDATA", local.parent().unwrap().join("Roaming"));
+        Run {
+            output: command.output().unwrap(),
+        }
     };
-    assert_eq!(run.code(), 1, "{}", run.text());
-    assert!(
-        run.text().contains("refusing to place sothis"),
-        "{}",
-        run.text()
-    );
-    assert!(!home.exists(), "nothing may be written: {}", run.text());
 
-    let mut allowed = ps1_command(
-        &release,
-        &cosign,
-        &dirs,
-        &["-Version", VERSION, "-NoInstall", "-AllowVirtualizedRoot"],
-    );
-    allowed
-        .env("SOTHIS_HOME", &home)
-        .env("SOTHIS_ASSUME_PACKAGE", "Claude_1.0.0.0_x64__test");
-    let run = Run {
-        output: allowed.output().unwrap(),
-    };
-    assert_eq!(run.code(), 0, "{}", run.text());
+    let first = probe_run(&["-Version", VERSION, "-NoInstall"]);
+    if first.code() == 0 {
+        assert!(
+            home.join("bin").join(exe_name()).is_file(),
+            "{}",
+            first.text()
+        );
+    } else {
+        assert_eq!(first.code(), 1, "{}", first.text());
+        assert!(
+            first.text().contains("refusing to place sothis"),
+            "{}",
+            first.text()
+        );
+        assert!(first.text().contains("Packages"), "{}", first.text());
+        assert!(
+            !home.join("bin").join(exe_name()).exists(),
+            "{}",
+            first.text()
+        );
+    }
+    let _ = fs::remove_dir_all(&home);
+
+    let allowed = probe_run(&["-Version", VERSION, "-NoInstall", "-AllowVirtualizedRoot"]);
+    assert_eq!(allowed.code(), 0, "{}", allowed.text());
     assert!(home.join("bin").join(exe_name()).is_file());
+    let _ = fs::remove_dir_all(&home);
 }
