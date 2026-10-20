@@ -522,3 +522,56 @@ fn env_defaults_to_dot_sothis_in_the_profile_not_localappdata() {
             .as_ref()
     );
 }
+
+#[test]
+fn update_plan_lists_the_plugin_update_steps() {
+    let temp = Temp::new("plan-plugins");
+    let plugins = temp.0.join("plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    fs::write(
+        plugins.join("installed_plugins.json"),
+        r#"{"version":2,"plugins":{"sirius@sothis":[{"scope":"user"}],"sirius@sirius-forester":[{}]}}"#,
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_sothis"))
+            .args(args)
+            .env("SOTHIS_HOME", temp.0.join("home"))
+            .env("CLAUDE_PLUGINS_DIR", &plugins)
+            .output()
+            .unwrap()
+    };
+    let output = run(&["update", "--plan", "--profile", "core", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let steps = json(&output)["pluginSteps"].clone();
+    assert_eq!(
+        steps,
+        serde_json::json!([
+            "claude plugin marketplace update sothis",
+            "claude plugin update sirius@sothis"
+        ])
+    );
+
+    let human = run(&["update", "--plan", "--profile", "core"]);
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("plugin steps:"), "{text}");
+    assert!(
+        text.contains("claude plugin update sirius@sothis"),
+        "{text}"
+    );
+    assert!(text.contains("no machine state changed"), "{text}");
+
+    let skipped = run(&[
+        "update",
+        "--plan",
+        "--profile",
+        "core",
+        "--no-plugins",
+        "--json",
+    ]);
+    assert_eq!(json(&skipped)["pluginSteps"], serde_json::json!([]));
+    // Install plans do not list plugin updates.
+    let install = run(&["install", "--plan", "--profile", "core", "--json"]);
+    assert_eq!(json(&install)["pluginSteps"], serde_json::json!([]));
+    assert!(!temp.0.join("home").exists(), "a plan writes nothing");
+}

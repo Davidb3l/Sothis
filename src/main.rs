@@ -185,7 +185,7 @@ fn command_plan(
             .key()
             .to_string(),
     };
-    reject_unknown_args(args, &["--plan", "--profile", "--platform"])?;
+    reject_unknown_args(args, &["--plan", "--profile", "--platform", "--no-plugins"])?;
     let cwd = std::env::current_dir().map_err(|e| (1, format!("could not read cwd: {e}")))?;
     let profile = resolve_profile(manifest, requested_profile, &cwd)?;
     let mut items = plan::build(manifest, &profile, &platform).map_err(|e| (2, e))?;
@@ -193,6 +193,15 @@ fn command_plan(
     if operation == "uninstall" {
         items.reverse();
     }
+    // `update` also refreshes installed suite plugins (read-only lookup here).
+    let plugin_steps = if operation == "update" && !args.iter().any(|arg| arg == "--no-plugins") {
+        let state = install::plugins::load_state(doctor::claude_plugins_dir().as_deref())
+            .unwrap_or_default();
+        let targets = install::plugins::update_targets(manifest, &state);
+        install::plugins::update_commands(&manifest.marketplace.canonical.name, &targets)
+    } else {
+        Vec::new()
+    };
     if json_output {
         print_json(&json!({
             "ok": true,
@@ -200,7 +209,8 @@ fn command_plan(
             "profile": profile,
             "platform": platform,
             "dryRun": true,
-            "items": items
+            "items": items,
+            "pluginSteps": plugin_steps
         }))?;
     } else {
         println!("{operation} plan: profile={profile}, platform={platform}");
@@ -208,6 +218,12 @@ fn command_plan(
             println!("- {:?}: {} [{}]", item.action, item.name, item.support);
             if let Some(note) = item.note {
                 println!("  {note}");
+            }
+        }
+        if !plugin_steps.is_empty() {
+            println!("plugin steps:");
+            for step in &plugin_steps {
+                println!("- {step}");
             }
         }
         println!("dry run only; no machine state changed");

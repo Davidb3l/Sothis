@@ -1541,3 +1541,221 @@ fn no_legacy_note_without_receipts_or_when_the_legacy_root_is_the_root() {
         .iter()
         .all(|w| !w.contains("v0.1.0 install exists")));
 }
+
+// ------------------------------------------------------------ plugin refresh
+
+impl Harness {
+    /// Pretend Claude Code has these `name@marketplace` plugins installed.
+    fn set_installed_plugins(&self, ids: &[&str]) {
+        let plugins = ids
+            .iter()
+            .map(|id| format!("\"{id}\":[{{\"scope\":\"user\"}}]"))
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(
+            self.plugin_dir.join("installed_plugins.json"),
+            format!("{{\"version\":2,\"plugins\":{{{plugins}}}}}"),
+        )
+        .unwrap();
+        fs::write(
+            self.plugin_dir.join("known_marketplaces.json"),
+            "{\"sothis\":{\"source\":{}}}",
+        )
+        .unwrap();
+    }
+
+    fn claude_calls(&self) -> Vec<String> {
+        self.claude.calls.borrow().clone()
+    }
+}
+
+const SUITE_PLUGINS: [&str; 4] = [
+    "hayvenhurst@sothis",
+    "sirius@sothis",
+    "catryna@sothis",
+    "sothis@sothis",
+];
+
+fn plugin_update_opts() -> Options {
+    let mut options = opts(Operation::Update, "core");
+    options.plugins = true;
+    options
+}
+
+#[test]
+fn update_refreshes_the_marketplace_once_then_each_installed_plugin() {
+    let mut h = Harness::new();
+    h.install("core");
+    h.set_installed_plugins(&SUITE_PLUGINS);
+    h.claude.outputs = vec![
+        (
+            "update hayvenhurst@sothis",
+            "Plugin \"hayvenhurst\" updated from 0.0.9 to 0.0.10. Restart to apply changes.",
+        ),
+        (
+            "update sirius@sothis",
+            "sirius is already at the latest version (0.2.7).",
+        ),
+    ];
+    let summary = h.run(&plugin_update_opts()).unwrap();
+    assert!(summary.ok, "{}", summary.render_human());
+    let calls = h.claude_calls();
+    assert_eq!(calls[0], "plugin marketplace update sothis");
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.contains("marketplace update"))
+            .count(),
+        1,
+        "{calls:?}"
+    );
+    for id in SUITE_PLUGINS {
+        assert!(
+            calls.contains(&format!("plugin update {id}")),
+            "{id} in {calls:?}"
+        );
+    }
+    assert_eq!(calls.len(), 1 + SUITE_PLUGINS.len(), "{calls:?}");
+    assert!(
+        !calls.iter().any(|call| call.contains("install")),
+        "an installed plugin is never reinstalled: {calls:?}"
+    );
+    let hayven = item(&summary, "hayvenhurst", "update_plugin");
+    assert_eq!(hayven.result, "updated");
+    assert!(hayven.detail.contains("0.0.9 to 0.0.10"));
+    assert_eq!(
+        item(&summary, "sirius-forester", "update_plugin").result,
+        "up-to-date"
+    );
+    assert_eq!(
+        item(&summary, "sothis", "update_marketplace").result,
+        "updated"
+    );
+    // The install-time "already installed" line is not repeated by update.
+    assert!(summary.items.iter().all(|i| i.action != "install_plugin"));
+}
+
+#[test]
+fn a_failing_plugin_update_is_reported_without_failing_the_binary_updates() {
+    let mut h = Harness::new();
+    h.set_version("hayvenhurst", "0.0.8");
+    h.publish("hayvenhurst", "0.0.8");
+    h.install("core");
+    h.set_version("hayvenhurst", "0.0.9");
+    h.publish("hayvenhurst", "0.0.9");
+    h.set_installed_plugins(&SUITE_PLUGINS);
+    h.claude.fail_on = Some("plugin update sirius@sothis");
+    let summary = h.run(&plugin_update_opts()).unwrap();
+    // The binary updated, and its own result is untouched by the plugin failure.
+    let binary = item(&summary, "hayvenhurst", "check_for_update");
+    assert_eq!(binary.result, "updated");
+    assert!(!binary.failed);
+    assert_eq!(h.bin_text("hayven.exe"), "hayven 0.0.9");
+    // The failure is its own failed step, and the other plugins still ran.
+    let failed = item(&summary, "sirius-forester", "update_plugin");
+    assert!(failed.failed);
+    assert_eq!(failed.result, "failed");
+    assert!(failed.detail.contains("sirius@sothis"));
+    assert!(!summary.ok);
+    assert!(h
+        .claude_calls()
+        .contains(&"plugin update sothis@sothis".to_string()));
+    assert!(!item(&summary, "hayvenhurst", "update_plugin").failed);
+}
+
+#[test]
+fn a_failed_marketplace_refresh_skips_the_plugin_updates() {
+    let mut h = Harness::new();
+    h.install("core");
+    h.set_installed_plugins(&SUITE_PLUGINS);
+    h.claude.fail_on = Some("marketplace update");
+    let summary = h.run(&plugin_update_opts()).unwrap();
+    assert!(!summary.ok);
+    let failed = item(&summary, "sothis", "update_marketplace");
+    assert!(failed.failed);
+    assert_eq!(h.claude_calls(), ["plugin marketplace update sothis"]);
+    assert!(summary.items.iter().all(|i| i.action != "update_plugin"));
+}
+
+#[test]
+fn no_plugins_skips_every_plugin_step_on_update() {
+    let mut h = Harness::new();
+    h.install("core");
+    h.set_installed_plugins(&SUITE_PLUGINS);
+    let summary = h.run(&opts(Operation::Update, "core")).unwrap();
+    assert!(summary.ok);
+    assert!(h.claude_calls().is_empty());
+    assert!(summary.items.iter().all(|i| !i.action.contains("plugin")));
+}
+
+#[test]
+fn update_installs_a_missing_plugin_but_does_not_also_update_it() {
+    let mut h = Harness::new();
+    h.install("core");
+    h.set_installed_plugins(&["sirius@sothis"]);
+    let summary = h.run(&plugin_update_opts()).unwrap();
+    assert!(summary.ok, "{}", summary.render_human());
+    let calls = h.claude_calls();
+    assert!(calls.contains(&"plugin install hayvenhurst@sothis".to_string()));
+    assert!(calls.contains(&"plugin update sirius@sothis".to_string()));
+    assert!(
+        !calls.contains(&"plugin update hayvenhurst@sothis".to_string()),
+        "just installed, so not updated: {calls:?}"
+    );
+    assert_eq!(
+        item(&summary, "hayvenhurst", "install_plugin").result,
+        "installed"
+    );
+}
+
+#[test]
+fn update_without_any_installed_plugin_runs_no_refresh() {
+    let mut h = Harness::new();
+    h.install("core");
+    h.claude.fail_on = Some("never matches");
+    let summary = h.run(&plugin_update_opts()).unwrap();
+    assert!(summary.ok);
+    assert!(!h
+        .claude_calls()
+        .iter()
+        .any(|call| call.contains("marketplace update") || call.contains("plugin update")));
+}
+
+#[test]
+fn update_without_the_claude_cli_reports_the_exact_commands() {
+    let mut h = Harness::new();
+    h.install("core");
+    h.set_installed_plugins(&["sirius@sothis"]);
+    h.claude = FakeClaude::new(false);
+    let summary = h.run(&plugin_update_opts()).unwrap();
+    assert!(summary.ok);
+    let manual = item(&summary, "sothis", "update_plugin");
+    assert_eq!(manual.result, "manual");
+    assert!(manual
+        .detail
+        .contains("claude plugin marketplace update sothis && claude plugin update sirius@sothis"));
+}
+
+#[test]
+fn install_keeps_install_semantics_and_points_at_update_for_installed_plugins() {
+    let mut h = Harness::new();
+    h.set_installed_plugins(&["sirius@sothis"]);
+    let mut options = opts(Operation::Install, "core");
+    options.plugins = true;
+    let summary = h.run(&options).unwrap();
+    assert!(summary.ok);
+    let existing = item(&summary, "sirius-forester", "install_plugin");
+    assert_eq!(existing.result, "already-installed");
+    assert!(existing
+        .detail
+        .contains("run `sothis update` to refresh it"));
+    assert!(
+        h.claude_calls().iter().all(|call| !call.contains("update")),
+        "install never updates plugins: {:?}",
+        h.claude_calls()
+    );
+    assert!(summary
+        .items
+        .iter()
+        .all(|i| i.action != "update_plugin" && i.action != "update_marketplace"));
+}
