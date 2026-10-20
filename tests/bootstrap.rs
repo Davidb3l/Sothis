@@ -289,6 +289,41 @@ fn run_ps1(setup: &Setup<'_>, args: &[&str]) -> Run {
     }
 }
 
+/// Runs install.ps1 the way a user who logs the install does
+/// (`& install.ps1 ... 2>&1 | Out-String -Stream`). Under that redirection,
+/// Windows PowerShell turns a native program's stderr lines into error
+/// records, which the script's `$ErrorActionPreference = 'Stop'` must not
+/// treat as failures.
+#[cfg(windows)]
+fn run_ps1_redirected(setup: &Setup<'_>, args: &[&str]) -> Run {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("install.ps1");
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    // Parameter names stay bare (a quoted '-Profile' is a positional string);
+    // values are single-quoted.
+    let arg = |s: &&str| {
+        if s.starts_with('-') {
+            s.to_string()
+        } else {
+            quote(s)
+        }
+    };
+    let invocation = format!(
+        "& {} {} 2>&1 | Out-String -Stream; exit $LASTEXITCODE",
+        quote(&script.to_string_lossy()),
+        args.iter().map(arg).collect::<Vec<_>>().join(" ")
+    );
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"])
+        .arg(invocation);
+    env_for(&mut command, setup, false);
+    Run {
+        output: command.output().unwrap(),
+    }
+}
+
 fn placed(home: &Path) -> PathBuf {
     home.join("bin").join(exe_name())
 }
@@ -673,6 +708,14 @@ ps1_tests! {
     ps1_a_sidecar_for_another_file_is_fatal => scenario_a_sidecar_for_another_file_is_fatal;
     ps1_a_present_cosign_needs_the_bundle => scenario_a_cosign_that_is_present_needs_the_bundle;
     ps1_hand_off_propagates_the_exit_code => scenario_hand_off_runs_sothis_install_and_propagates_its_exit_code;
+}
+
+#[cfg(windows)]
+#[test]
+fn ps1_hand_off_survives_a_caller_that_redirects_stderr() {
+    // `sothis install` prints its header on stderr; a caller logging with
+    // `2>&1` must still get the real outcome, not a spurious failure.
+    scenario_hand_off_runs_sothis_install_and_propagates_its_exit_code(run_ps1_redirected, &PS1);
 }
 
 #[cfg(windows)]

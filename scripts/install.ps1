@@ -381,10 +381,20 @@ function Install-Sothis {
             if ($NoModifyPath) { $installArgs += '--no-modify-path' }
             if ($NoPlugins) { $installArgs += '--no-plugins' }
             Write-Note ('running: sothis ' + ($installArgs -join ' '))
-            # Inherit the console: sothis prints its own plan and results.
-            # (Out-Host keeps its output out of this function's return value.)
-            & $dest @installArgs | Out-Host
-            $exitCode = $LASTEXITCODE
+            # sothis prints its own plan and results, partly on stderr. When the
+            # caller redirects (`install.ps1 2>&1 | Tee-Object log`), Windows
+            # PowerShell turns each native stderr line into an error record, and
+            # this script's 'Stop' preference would make the first one fatal.
+            # Merge the streams as plain text and judge success by the exit code
+            # alone. (Out-Host keeps the output out of this function's return.)
+            $previousPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                & $dest @installArgs 2>&1 | ForEach-Object { "$_" } | Out-Host
+                $exitCode = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $previousPreference
+            }
         }
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
