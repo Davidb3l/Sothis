@@ -97,3 +97,43 @@ mutation is recorded in a journal so a failure restores the exact prior state.
 - The crate gained dependencies (ureq/rustls, sha2, flate2, tar, lzma-rs, zip,
   and `winreg`/`windows-sys` on Windows) and its minimum Rust version is now
   1.89 (std file locking).
+
+## Amendment (v0.1.1): the Windows root moves out of AppData
+
+Date: 2026-10-20. Item 1 (Layout) above is superseded for Windows.
+
+The Claude desktop app on Windows is an MSIX-packaged app. Processes it
+launches, including Claude Code's shells and therefore `sothis` and
+`install.ps1`, run inside the package container, where file-system
+virtualization redirects new writes under `%LOCALAPPDATA%` and `%APPDATA%` to
+`%LOCALAPPDATA%\Packages\<PackageFamilyName>\LocalCache\Local\...`. Registry
+writes are not virtualized. A v0.1.0 install run from Claude Code therefore
+landed in the package's private folder, visible only inside the container, while
+the user `PATH` (`HKCU\Environment`) received a real entry for
+`%LOCALAPPDATA%\Sothis\bin`, a directory that does not exist for any normal
+process, which kept using its old tool copies. Writes outside AppData
+(`%USERPROFILE%\.local\bin`, `%USERPROFILE%\.cargo\bin`) are not virtualized,
+which is why the tools' own installers worked.
+
+Decision, all on Windows (macOS and Linux are unchanged, and `SOTHIS_HOME` still
+replaces everything):
+
+1. **Default root `%USERPROFILE%\.sothis`**, bin `%USERPROFILE%\.sothis\bin`,
+   mirroring `.cargo` and `.bun`. `USERPROFILE` (else the OS profile directory)
+   must be absolute. The bootstrap scripts place `sothis` in the same directory.
+2. **Legacy migration.** `install`/`update` remove exactly the Sothis-owned
+   `%LOCALAPPDATA%\Sothis\bin` entry (expanded or unexpanded spelling, case and
+   trailing-slash insensitive) from the user `PATH` while prepending the new bin,
+   and report a migration line; nothing else on `PATH` is touched, and the value
+   type is preserved. A non-empty `%LOCALAPPDATA%\Sothis\state\receipts` is never
+   adopted or deleted: it is reported (a warning from `install`/`update`, and the
+   `legacy_root` warning in `doctor`) with the commands that remove it.
+3. **Packaged-context detection** via `GetCurrentPackageFullName`
+   (`ERROR_SUCCESS`/`ERROR_INSUFFICIENT_BUFFER` when packaged,
+   `APPMODEL_ERROR_NO_PACKAGE` otherwise), behind a `PackageContext` trait so
+   tests can fake it. `doctor` reports the package and fails
+   `root_not_virtualized` for a root under `%LOCALAPPDATA%` or `%APPDATA%` while
+   packaged; `install`/`update` refuse, writing nothing, unless
+   `--allow-virtualized-root` is given (`uninstall` and `rollback` stay possible
+   so an old install can still be removed). `SOTHIS_ASSUME_PACKAGE` makes the
+   process report a package for tests; it can only make the checks stricter.

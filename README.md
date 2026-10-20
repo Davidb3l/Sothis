@@ -90,6 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/Davidb3l/Sothis/main/scripts/instal
 | `-AllowMissingCosign` | `--allow-missing-cosign` | Accept checksum-only verification if cosign is absent (also passed to `sothis install`) |
 | `-NoModifyPath` | `--no-modify-path` | Passed to `sothis install` |
 | `-NoPlugins` | `--no-plugins` | Passed to `sothis install` |
+| `-AllowVirtualizedRoot` | `--allow-virtualized-root` | Passed to `sothis install`; see [Running from the Claude desktop app on Windows](#running-from-the-claude-desktop-app-on-windows) |
 
 The scripts fail closed: a sha256 that does not match, a missing checksum, a
 missing cosign (without the opt-out) or a signature cosign rejects stops the
@@ -181,9 +182,13 @@ Output marks each line `[OK]`, `[WARN]`, `[FAIL]` or `[SKIP]`; `--json` adds a
 
 | | State root (receipts, retained versions, staging) | Bin directory (what lands on `PATH`) |
 | --- | --- | --- |
-| Windows | `%LOCALAPPDATA%\Sothis` | `%LOCALAPPDATA%\Sothis\bin` |
+| Windows | `%USERPROFILE%\.sothis` | `%USERPROFILE%\.sothis\bin` |
 | macOS / Linux | `$XDG_DATA_HOME/sothis`, else `~/.local/share/sothis` | `~/.local/bin` |
 | `SOTHIS_HOME=<abs dir>` | `<dir>` | `<dir>/bin` |
+
+The Windows root is a dot-directory in your profile, like `.cargo` and `.bun`,
+and deliberately **not** under `%LOCALAPPDATA%` (v0.1.0's default); see
+[Running from the Claude desktop app on Windows](#running-from-the-claude-desktop-app-on-windows).
 
 `SOTHIS_HOME` replaces the whole layout on every OS; use it to try an install
 in a throwaway directory (`--no-modify-path --no-plugins` keep it hermetic).
@@ -201,6 +206,46 @@ Sothis never edits shell profiles; it prints the line to add, for example
 `export PATH="$HOME/.local/bin:$PATH"`. If another directory earlier on `PATH`
 provides the same command, the install says so (and `sothis doctor` keeps
 saying so until it is fixed).
+
+If a v0.1.0 install is still at `%LOCALAPPDATA%\Sothis`, `sothis install` removes
+exactly that one entry (`%LOCALAPPDATA%\Sothis\bin`, in any spelling) from your
+user `PATH` while adding the new bin directory, and reports it as a migration
+line. It leaves everything else on `PATH` alone, and it never adopts or deletes
+the old folder; it prints how to remove it instead (`sothis doctor` warns as
+`legacy_root`):
+
+```powershell
+$env:SOTHIS_HOME = "$env:LOCALAPPDATA\Sothis"
+sothis uninstall --profile <the profile you installed> --no-modify-path
+# then delete the %LOCALAPPDATA%\Sothis folder
+```
+
+### Running from the Claude desktop app on Windows
+
+The Claude desktop app is an MSIX-packaged app. Windows runs the processes it
+starts (including Claude Code's shells, and so `sothis` and `install.ps1`)
+inside the package container, where **file-system virtualization silently
+redirects new writes under `%LOCALAPPDATA%` and `%APPDATA%`** into
+`%LOCALAPPDATA%\Packages\<package>\LocalCache\...`. Registry writes are not
+redirected. So v0.1.0, which installed under `%LOCALAPPDATA%\Sothis`, put the
+tools where only the container could see them while the `PATH` edit pointed
+every other process at a directory that does not exist.
+
+Since v0.1.1 the default root is `%USERPROFILE%\.sothis`, which is not
+virtualized (the same reason the per-tool installers that write to
+`%USERPROFILE%\.local\bin` or `%USERPROFILE%\.cargo\bin` work from Claude
+sessions). In addition:
+
+- `sothis doctor` notes when it runs inside a package and **fails**
+  `root_not_virtualized` if the effective root (including a `SOTHIS_HOME`
+  override) is under `%LOCALAPPDATA%` or `%APPDATA%`.
+- `sothis install` and `sothis update` refuse to run in that situation, writing
+  nothing, unless you pass `--allow-virtualized-root`.
+- `install.ps1` does the same before placing `sothis.exe`
+  (`-AllowVirtualizedRoot` to override).
+
+Detection uses `GetCurrentPackageFullName`; a normal terminal is not packaged,
+so none of this applies there.
 
 ### Windows Smart App Control
 
