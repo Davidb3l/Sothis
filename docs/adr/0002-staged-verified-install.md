@@ -102,16 +102,17 @@ mutation is recorded in a journal so a failure restores the exact prior state.
 
 Date: 2026-10-20. Item 1 (Layout) above is superseded for Windows.
 
-The Claude desktop app on Windows is an MSIX-packaged app. Processes it
-launches, including Claude Code's shells and therefore `sothis` and
-`install.ps1`, run inside the package container, where file-system
-virtualization redirects new writes under `%LOCALAPPDATA%` and `%APPDATA%` to
-`%LOCALAPPDATA%\Packages\<PackageFamilyName>\LocalCache\Local\...`. Registry
-writes are not virtualized. A v0.1.0 install run from Claude Code therefore
-landed in the package's private folder, visible only inside the container, while
-the user `PATH` (`HKCU\Environment`) received a real entry for
-`%LOCALAPPDATA%\Sothis\bin`, a directory that does not exist for any normal
-process, which kept using its old tool copies. Writes outside AppData
+Processes started by the Claude desktop app on Windows (Claude Code's shells,
+and therefore `sothis` and `install.ps1`) have their new writes under
+`%LOCALAPPDATA%` and `%APPDATA%` redirected by file-system virtualization to
+`%LOCALAPPDATA%\Packages\<PackageFamilyName>\LocalCache\Local\...`. This happens
+even though the process has no package identity (`GetCurrentPackageFullName`
+returns `APPMODEL_ERROR_NO_PACKAGE`), so it cannot be detected from process
+properties. Registry writes are not virtualized. A v0.1.0 install run from
+Claude Code therefore landed in the package's private folder, visible only to
+virtualized processes, while the user `PATH` (`HKCU\Environment`) received a
+real entry for `%LOCALAPPDATA%\Sothis\bin`, a directory that does not exist for
+any normal process, which kept using its old tool copies. Writes outside AppData
 (`%USERPROFILE%\.local\bin`, `%USERPROFILE%\.cargo\bin`) are not virtualized,
 which is why the tools' own installers worked.
 
@@ -128,15 +129,23 @@ replaces everything):
    type is preserved. A non-empty `%LOCALAPPDATA%\Sothis\state\receipts` is never
    adopted or deleted: it is reported (a warning from `install`/`update`, and the
    `legacy_root` warning in `doctor`) with the commands that remove it.
-3. **Packaged-context detection** via `GetCurrentPackageFullName`
-   (`ERROR_SUCCESS`/`ERROR_INSUFFICIENT_BUFFER` when packaged,
-   `APPMODEL_ERROR_NO_PACKAGE` otherwise), behind a `PackageContext` trait so
-   tests can fake it. `doctor` reports the package and fails
-   `root_not_virtualized` for a root under `%LOCALAPPDATA%` or `%APPDATA%` while
-   packaged; `install`/`update` refuse, writing nothing, unless
-   `--allow-virtualized-root` is given (`uninstall` and `rollback` stay possible
-   so an old install can still be removed). `SOTHIS_ASSUME_PACKAGE` makes the
-   process report a package for tests; it can only make the checks stricter.
+3. **Detection by probe.** Because virtualization happens without package
+   identity, Sothis observes it: it creates a uniquely named probe file in the
+   target directory (the nearest existing ancestor when the root does not exist
+   yet), opens it, resolves the handle with `GetFinalPathNameByHandleW`
+   (`FILE_NAME_NORMALIZED | VOLUME_NAME_DOS`), strips `\\?\`, and deletes it. The
+   directory is virtualized when the final path differs from the requested path
+   and lands under `...\Packages\<package>\LocalCache\...`; other differences
+   (junctions, `subst`) are not virtualization, and a probe that cannot be
+   completed is "unknown", never a failure. The probe sits behind a
+   `VirtualizationProbe` trait so tests fake it. `doctor` fails
+   `root_not_virtualized` (naming the package folder) for a virtualized root or
+   bin directory, including a `SOTHIS_HOME` override; `install`/`update` probe
+   before writing anything else and refuse, leaving nothing behind, unless
+   `--allow-virtualized-root` or `SOTHIS_ALLOW_VIRTUALIZED_ROOT` is given
+   (`uninstall` and `rollback` stay possible so an old install can still be
+   removed). `install.ps1` runs the same probe, only when its target is under
+   `%LOCALAPPDATA%` or `%APPDATA%`.
 
 ## Amendment (v0.1.1): plugins are refreshed by `update`
 

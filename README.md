@@ -90,7 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/Davidb3l/Sothis/main/scripts/instal
 | `-AllowMissingCosign` | `--allow-missing-cosign` | Accept checksum-only verification if cosign is absent (also passed to `sothis install`) |
 | `-NoModifyPath` | `--no-modify-path` | Passed to `sothis install` |
 | `-NoPlugins` | `--no-plugins` | Passed to `sothis install` |
-| `-AllowVirtualizedRoot` | `--allow-virtualized-root` | Passed to `sothis install`; see [Running from the Claude desktop app on Windows](#running-from-the-claude-desktop-app-on-windows) |
+| `-AllowVirtualizedRoot` | `--allow-virtualized-root` | Passed to `sothis install`; see [Running from the Claude desktop app on Windows](#running-from-the-claude-desktop-app-on-windows) (also `SOTHIS_ALLOW_VIRTUALIZED_ROOT=1`) |
 
 The scripts fail closed: a sha256 that does not match, a missing checksum, a
 missing cosign (without the opt-out) or a signature cosign rejects stops the
@@ -229,30 +229,37 @@ sothis uninstall --profile <the profile you installed> --no-modify-path
 
 ### Running from the Claude desktop app on Windows
 
-The Claude desktop app is an MSIX-packaged app. Windows runs the processes it
-starts (including Claude Code's shells, and so `sothis` and `install.ps1`)
-inside the package container, where **file-system virtualization silently
-redirects new writes under `%LOCALAPPDATA%` and `%APPDATA%`** into
-`%LOCALAPPDATA%\Packages\<package>\LocalCache\...`. Registry writes are not
+Processes started by the Claude desktop app (Claude Code's shells, and so
+`sothis` and `install.ps1`) have **their new writes under `%LOCALAPPDATA%` and
+`%APPDATA%` silently redirected** by Windows file-system virtualization into
+`%LOCALAPPDATA%\Packages\<package>\LocalCache\...`. This happens even though
+such a process reports no package identity, so it cannot be predicted from the
+process; it can only be observed. Registry writes (the user `PATH`) are not
 redirected. So v0.1.0, which installed under `%LOCALAPPDATA%\Sothis`, put the
-tools where only the container could see them while the `PATH` edit pointed
-every other process at a directory that does not exist.
+tools where only the virtualized processes could see them while the `PATH` edit
+pointed every other process at a directory that does not exist.
 
 Since v0.1.1 the default root is `%USERPROFILE%\.sothis`, which is not
 virtualized (the same reason the per-tool installers that write to
 `%USERPROFILE%\.local\bin` or `%USERPROFILE%\.cargo\bin` work from Claude
-sessions). In addition:
+sessions). In addition, Sothis checks by experiment: it creates a uniquely named
+probe file in the target directory (the nearest existing ancestor if the root
+does not exist yet), asks Windows where the open handle really lives
+(`GetFinalPathNameByHandle`), and deletes it. If the file landed under
+`...\Packages\<package>\LocalCache\...` the directory is virtualized. A probe
+that cannot be completed is "unknown", never a failure.
 
-- `sothis doctor` notes when it runs inside a package and **fails**
-  `root_not_virtualized` if the effective root (including a `SOTHIS_HOME`
-  override) is under `%LOCALAPPDATA%` or `%APPDATA%`.
-- `sothis install` and `sothis update` refuse to run in that situation, writing
-  nothing, unless you pass `--allow-virtualized-root`.
-- `install.ps1` does the same before placing `sothis.exe`
-  (`-AllowVirtualizedRoot` to override).
+- `sothis doctor` **fails** `root_not_virtualized` (naming the package folder)
+  when the root, including a `SOTHIS_HOME` override, is virtualized, and passes
+  it otherwise.
+- `sothis install` and `sothis update` run the probe before writing anything
+  else and refuse, writing nothing, unless you pass `--allow-virtualized-root`
+  (or set `SOTHIS_ALLOW_VIRTUALIZED_ROOT=1`).
+- `install.ps1` does the same before placing `sothis.exe`, only when the target
+  is under `%LOCALAPPDATA%` or `%APPDATA%` (`-AllowVirtualizedRoot` to
+  override); the default location never needs it.
 
-Detection uses `GetCurrentPackageFullName`; a normal terminal is not packaged,
-so none of this applies there.
+A normal terminal is not virtualized, so none of this changes anything there.
 
 ### Windows Smart App Control
 

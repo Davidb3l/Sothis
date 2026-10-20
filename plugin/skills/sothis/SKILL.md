@@ -55,10 +55,11 @@ first (`sothis update --plan` previews an update).
   never touched.
 - `sothis env` prints the Sothis root and bin directory (`SOTHIS_HOME`
   overrides both, which makes a throwaway trial safe). On Windows the default
-  is `%USERPROFILE%\.sothis`, deliberately outside `%LOCALAPPDATA%`: inside the
-  Claude desktop app (an MSIX package) writes under AppData are redirected into
-  the package's private folder. `sothis doctor` fails `root_not_virtualized`, and
-  `install`/`update` refuse, for a root under AppData while packaged.
+  is `%USERPROFILE%\.sothis`, deliberately outside `%LOCALAPPDATA%`: in
+  processes started by the Claude desktop app, new writes under AppData are
+  silently redirected into a package's private folder. `sothis doctor` fails
+  `root_not_virtualized`, and `install`/`update` refuse, when a probe file shows
+  the root is virtualized.
 
 A failed tool is rolled back and the command exits non-zero; report exactly
 which tools succeeded. A sha256 mismatch or a rejected signature is never
