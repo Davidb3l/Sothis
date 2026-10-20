@@ -92,6 +92,16 @@ fn opts(operation: Operation, profile: &str) -> Options {
     }
 }
 
+/// Fixture versions for the engine tests, decoupled from the shipped manifest:
+/// these tests exercise the engine, so a routine manifest bump (a new tool
+/// release) must not break them. The real recommended versions are pinned by
+/// `manifest::tests::recommended_versions_track_the_published_releases`.
+const FIXTURE_VERSIONS: [(&str, &str); 3] = [
+    ("ametrite", "0.4.2"),
+    ("hayvenhurst", "0.0.9"),
+    ("sirius-forester", "0.1.7"),
+];
+
 impl Harness {
     fn new() -> Self {
         let dir = TempDir::new("engine");
@@ -103,7 +113,7 @@ impl Harness {
         let plugin_dir = dir.path().join("claude-plugins");
         fs::create_dir_all(&mirror).unwrap();
         fs::create_dir_all(&plugin_dir).unwrap();
-        let harness = Harness {
+        let mut harness = Harness {
             _dir: dir,
             layout,
             mirror,
@@ -128,6 +138,9 @@ impl Harness {
             path_dirs: Vec::new(),
             on_path: BTreeMap::new(),
         };
+        for (id, version) in FIXTURE_VERSIONS {
+            harness.set_version(id, version);
+        }
         harness.publish_recommended();
         harness
     }
