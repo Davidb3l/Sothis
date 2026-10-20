@@ -2,8 +2,10 @@
 
 use crate::install::fsx::{self, CopyError};
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 /// Upper bound for one release archive.
@@ -149,10 +151,16 @@ impl Fetcher for MirrorFetcher {
     }
 }
 
+/// How long a download may go without receiving a single byte before it is
+/// abandoned. ureq 3 only has whole-phase timeouts (no per-read idle timeout
+/// like ureq 2), so [`StallGuardReader`] enforces this.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Downloads from GitHub release URLs.
 pub struct HttpFetcher {
     base: String,
     agent: ureq::Agent,
+    idle_timeout: Duration,
 }
 
 impl HttpFetcher {
@@ -163,19 +171,95 @@ impl HttpFetcher {
     /// `base` must be `https://...` in production; plain `http://` is accepted
     /// only so tests can talk to a loopback server.
     pub fn with_base(base: &str) -> Self {
-        let agent = ureq::AgentBuilder::new()
+        let config = ureq::Agent::config_builder()
             .https_only(base.starts_with("https://"))
-            .redirects(8)
-            .timeout_connect(Duration::from_secs(15))
-            .timeout_read(Duration::from_secs(60))
-            .timeout_write(Duration::from_secs(60))
-            .timeout(Duration::from_secs(30 * 60))
+            .max_redirects(8)
+            // ureq 3 reads HTTP(S)_PROXY from the environment by default;
+            // ureq 2 (and therefore every earlier Sothis) did not. Keep the
+            // direct, verified connection.
+            .proxy(None)
+            .timeout_connect(Some(Duration::from_secs(15)))
+            .timeout_send_request(Some(Duration::from_secs(60)))
+            .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_global(Some(Duration::from_secs(30 * 60)))
             .user_agent(concat!("sothis/", env!("CARGO_PKG_VERSION")))
             .build();
         HttpFetcher {
             base: base.trim_end_matches('/').to_string(),
-            agent,
+            agent: ureq::Agent::new_with_config(config),
+            idle_timeout: IDLE_TIMEOUT,
         }
+    }
+}
+
+/// Reads a body on a helper thread so that a connection that goes silent for
+/// longer than `idle` fails instead of hanging until the global timeout. The
+/// helper exits when the body ends, an error occurs, the reader is dropped, or
+/// (for a stalled socket) when the agent's global timeout fires.
+struct StallGuardReader {
+    chunks: mpsc::Receiver<io::Result<Vec<u8>>>,
+    pending: Vec<u8>,
+    offset: usize,
+    idle: Duration,
+}
+
+impl StallGuardReader {
+    fn spawn<R: Read + Send + 'static>(mut source: R, idle: Duration) -> io::Result<Self> {
+        let (sender, chunks) = mpsc::sync_channel(4);
+        thread::Builder::new()
+            .name("sothis-download".to_string())
+            .spawn(move || loop {
+                let mut buffer = vec![0u8; 64 * 1024];
+                match source.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        buffer.truncate(read);
+                        if sender.send(Ok(buffer)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        break;
+                    }
+                }
+            })?;
+        Ok(StallGuardReader {
+            chunks,
+            pending: Vec::new(),
+            offset: 0,
+            idle,
+        })
+    }
+}
+
+impl Read for StallGuardReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.offset >= self.pending.len() {
+            match self.chunks.recv_timeout(self.idle) {
+                Ok(Ok(chunk)) => {
+                    self.pending = chunk;
+                    self.offset = 0;
+                }
+                Ok(Err(error)) => return Err(error),
+                // The helper dropped its sender: the body ended.
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "no data received for {} seconds; the connection stalled",
+                            self.idle.as_secs()
+                        ),
+                    ))
+                }
+            }
+        }
+        let count = out.len().min(self.pending.len() - self.offset);
+        out[..count].copy_from_slice(&self.pending[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
     }
 }
 
@@ -184,13 +268,15 @@ impl Fetcher for HttpFetcher {
         let url = release_url(&self.base, asset)?;
         let response = match self.agent.get(&url).call() {
             Ok(response) => response,
-            Err(ureq::Error::Status(code, _)) => {
+            Err(ureq::Error::StatusCode(code)) => {
                 return Err(format!("download of {url} failed: HTTP {code}"))
             }
             Err(error) => return Err(format!("download of {url} failed: {error}")),
         };
         if let Some(length) = response
-            .header("Content-Length")
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<u64>().ok())
         {
             if length > cap {
@@ -199,7 +285,9 @@ impl Fetcher for HttpFetcher {
                 ));
             }
         }
-        let mut reader = response.into_reader();
+        let mut reader =
+            StallGuardReader::spawn(response.into_body().into_reader(), self.idle_timeout)
+                .map_err(|e| format!("could not start the download of {url}: {e}"))?;
         let what = url.clone();
         write_destination(dest, |writer| {
             fsx::copy_hashing(&mut reader, writer, cap).map_err(|e| describe_copy_error(e, &what))
@@ -436,5 +524,34 @@ mod tests {
         let big = fetcher.fetch(&asset("big.bin"), &dest, 10).unwrap_err();
         assert!(big.contains("size limit"), "{big}");
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn http_fetch_fails_when_the_connection_stalls_mid_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                // Promise 100 bytes, deliver 3, then go silent.
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nabc",
+                );
+                let _ = stream.flush();
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+        let work = TempDir::new("http-stall");
+        let mut fetcher = HttpFetcher::with_base(&format!("http://127.0.0.1:{port}"));
+        fetcher.idle_timeout = Duration::from_millis(300);
+        let dest = work.path().join("stalled");
+        let started = std::time::Instant::now();
+        let error = fetcher
+            .fetch(&asset("stalled.bin"), &dest, 1000)
+            .unwrap_err();
+        assert!(error.contains("stalled"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(4), "{error}");
+        assert!(!dest.exists(), "partial files must be removed");
     }
 }
