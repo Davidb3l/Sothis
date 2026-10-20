@@ -97,3 +97,72 @@ mutation is recorded in a journal so a failure restores the exact prior state.
 - The crate gained dependencies (ureq/rustls, sha2, flate2, tar, lzma-rs, zip,
   and `winreg`/`windows-sys` on Windows) and its minimum Rust version is now
   1.89 (std file locking).
+
+## Amendment (v0.1.1): the Windows root moves out of AppData
+
+Date: 2026-10-20. Item 1 (Layout) above is superseded for Windows.
+
+Processes started by the Claude desktop app on Windows (Claude Code's shells,
+and therefore `sothis` and `install.ps1`) have their new writes under
+`%LOCALAPPDATA%` and `%APPDATA%` redirected by file-system virtualization to
+`%LOCALAPPDATA%\Packages\<PackageFamilyName>\LocalCache\Local\...`. This happens
+even though the process has no package identity (`GetCurrentPackageFullName`
+returns `APPMODEL_ERROR_NO_PACKAGE`), so it cannot be detected from process
+properties. Registry writes are not virtualized. A v0.1.0 install run from
+Claude Code therefore landed in the package's private folder, visible only to
+virtualized processes, while the user `PATH` (`HKCU\Environment`) received a
+real entry for `%LOCALAPPDATA%\Sothis\bin`, a directory that does not exist for
+any normal process, which kept using its old tool copies. Writes outside AppData
+(`%USERPROFILE%\.local\bin`, `%USERPROFILE%\.cargo\bin`) are not virtualized,
+which is why the tools' own installers worked.
+
+Decision, all on Windows (macOS and Linux are unchanged, and `SOTHIS_HOME` still
+replaces everything):
+
+1. **Default root `%USERPROFILE%\.sothis`**, bin `%USERPROFILE%\.sothis\bin`,
+   mirroring `.cargo` and `.bun`. `USERPROFILE` (else the OS profile directory)
+   must be absolute. The bootstrap scripts place `sothis` in the same directory.
+2. **Legacy migration.** `install`/`update` remove exactly the Sothis-owned
+   `%LOCALAPPDATA%\Sothis\bin` entry (expanded or unexpanded spelling, case and
+   trailing-slash insensitive) from the user `PATH` while prepending the new bin,
+   and report a migration line; nothing else on `PATH` is touched, and the value
+   type is preserved. A non-empty `%LOCALAPPDATA%\Sothis\state\receipts` is never
+   adopted or deleted: it is reported (a warning from `install`/`update`, and the
+   `legacy_root` warning in `doctor`) with the commands that remove it.
+3. **Detection by probe.** Because virtualization happens without package
+   identity, Sothis observes it: it creates a uniquely named probe file in the
+   target directory (the nearest existing ancestor when the root does not exist
+   yet), opens it, resolves the handle with `GetFinalPathNameByHandleW`
+   (`FILE_NAME_NORMALIZED | VOLUME_NAME_DOS`), strips `\\?\`, and deletes it. The
+   directory is virtualized when the final path differs from the requested path
+   and lands under `...\Packages\<package>\LocalCache\...`; other differences
+   (junctions, `subst`) are not virtualization, and a probe that cannot be
+   completed is "unknown", never a failure. The probe sits behind a
+   `VirtualizationProbe` trait so tests fake it. `doctor` fails
+   `root_not_virtualized` (naming the package folder) for a virtualized root or
+   bin directory, including a `SOTHIS_HOME` override; `install`/`update` probe
+   before writing anything else and refuse, leaving nothing behind, unless
+   `--allow-virtualized-root` or `SOTHIS_ALLOW_VIRTUALIZED_ROOT` is given
+   (`uninstall` and `rollback` stay possible so an old install can still be
+   removed). `install.ps1` runs the same probe, only when its target is under
+   `%LOCALAPPDATA%` or `%APPDATA%`.
+
+## Amendment (v0.1.1): plugins are refreshed by `update`
+
+Date: 2026-10-20. Extends item 9 (Plugins) above.
+
+`install` only ever added a missing plugin, so an installed plugin was reported
+as `already-installed` forever while the marketplace moved on (a real machine
+kept `hayvenhurst@sothis` 0.0.9 when 0.0.10 was current, likewise `sirius` and
+`catryna`). Now `sothis update` runs `claude plugin marketplace update sothis`
+once and then `claude plugin update <name>@sothis` for each canonical suite
+plugin that is installed (every manifest tool's plugin, plus `sothis@sothis`),
+recording one `update_plugin` step each: `updated`, `up-to-date` (parsed from
+what the CLI prints; unrecognised successful output is reported verbatim as
+`checked`) or `failed`. A failed marketplace refresh skips the per-plugin
+updates, since they would compare against a stale catalog. Plugin failures are
+failed steps (exit 1) but never alter the binary results. Mutating `claude`
+commands are only ever run by `sothis` itself; the tests drive a fake runner.
+`install` keeps install semantics and, for an installed plugin, says to run
+`sothis update`. `--no-plugins` skips all of it and `update --plan` lists the
+steps.

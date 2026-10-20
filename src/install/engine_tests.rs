@@ -78,6 +78,8 @@ struct Harness {
     store: FakeStore,
     path_dirs: Vec<PathBuf>,
     on_path: BTreeMap<String, PathBuf>,
+    legacy_root: Option<PathBuf>,
+    legacy_path_entries: Vec<String>,
 }
 
 fn opts(operation: Operation, profile: &str) -> Options {
@@ -137,6 +139,8 @@ impl Harness {
             },
             path_dirs: Vec::new(),
             on_path: BTreeMap::new(),
+            legacy_root: None,
+            legacy_path_entries: Vec::new(),
         };
         for (id, version) in FIXTURE_VERSIONS {
             harness.set_version(id, version);
@@ -253,6 +257,8 @@ impl Harness {
             layout: &self.layout,
             platform: PLATFORM,
             exe_suffix: ".exe",
+            legacy_root: self.legacy_root.clone(),
+            legacy_path_entries: self.legacy_path_entries.clone(),
         };
         let services = Services {
             fetcher: &fetcher,
@@ -837,6 +843,8 @@ fn an_unwritable_user_path_is_a_failed_step() {
         layout: &h.layout,
         platform: PLATFORM,
         exe_suffix: ".exe",
+        legacy_root: None,
+        legacy_path_entries: Vec::new(),
     };
     let mut store = FailingStore;
     let options = opts(Operation::Install, "core");
@@ -875,6 +883,8 @@ fn advisory_path_mode_prints_the_exact_line_and_never_writes() {
         layout: &h.layout,
         platform: PLATFORM,
         exe_suffix: ".exe",
+        legacy_root: None,
+        legacy_path_entries: Vec::new(),
     };
     let options = opts(Operation::Install, "core");
     let summary = engine::run(
@@ -1415,4 +1425,337 @@ fn a_failed_first_install_leaves_no_tool_directory_behind() {
     assert!(h.receipt("hayvenhurst").is_none());
     assert_eq!(h.bin_names(), ["amt.exe", "sirius.exe"]);
     h.assert_no_scratch();
+}
+
+// ------------------------------------------------- v0.1.0 root migration
+
+const LEGACY_BIN: &str = r"C:\Users\t\AppData\Local\Sothis\bin";
+
+#[test]
+fn a_v0_1_0_path_entry_is_migrated_while_other_entries_are_untouched() {
+    let mut h = Harness::new();
+    h.legacy_path_entries = vec![
+        r"%LOCALAPPDATA%\Sothis\bin".to_string(),
+        LEGACY_BIN.to_string(),
+    ];
+    h.store.value = Some(PathValue {
+        value: format!(r"C:\Windows;{LEGACY_BIN}\;C:\Tools"),
+        expandable: false,
+    });
+    let summary = h.install("core");
+    assert!(summary.ok, "{:#?}", summary.items);
+    let value = h.store.value.clone().unwrap();
+    assert_eq!(
+        value.value,
+        format!(r"{};C:\Windows;C:\Tools", h.layout.bin.display())
+    );
+    assert!(!value.expandable, "the value type is preserved");
+    let migrated = item(&summary, "sothis", "migrate_path");
+    assert_eq!(migrated.result, "migrated");
+    assert!(!migrated.failed);
+    assert!(migrated.detail.contains(r"%LOCALAPPDATA%\Sothis\bin"));
+    assert!(summary.path_changed);
+    // A second run has nothing left to migrate and does not write.
+    let writes = h.store.writes;
+    let again = h.install("core");
+    assert!(again.items.iter().all(|i| i.action != "migrate_path"));
+    assert_eq!(h.store.writes, writes);
+}
+
+#[test]
+fn the_unexpanded_legacy_spelling_is_migrated_too() {
+    let mut h = Harness::new();
+    h.legacy_path_entries = vec![r"%LOCALAPPDATA%\Sothis\bin".to_string()];
+    h.store.value = Some(PathValue {
+        value: r"%localappdata%\SOTHIS\bin;C:\keep".to_string(),
+        expandable: true,
+    });
+    let summary = h.install("core");
+    assert!(summary.ok);
+    assert_eq!(
+        h.path_value(),
+        format!(r"{};C:\keep", h.layout.bin.display())
+    );
+    assert_eq!(item(&summary, "sothis", "migrate_path").result, "migrated");
+}
+
+#[test]
+fn no_modify_path_does_not_migrate_the_legacy_entry() {
+    let mut h = Harness::new();
+    h.legacy_path_entries = vec![LEGACY_BIN.to_string()];
+    h.store.value = Some(PathValue {
+        value: format!(r"C:\Windows;{LEGACY_BIN}"),
+        expandable: true,
+    });
+    let mut options = opts(Operation::Install, "core");
+    options.modify_path = false;
+    let summary = h.run(&options).unwrap();
+    assert!(summary.ok);
+    assert_eq!(h.store.writes, 0);
+    assert!(summary.items.iter().all(|i| i.action != "migrate_path"));
+}
+
+#[test]
+fn legacy_receipts_are_reported_and_never_adopted_or_deleted() {
+    let mut h = Harness::new();
+    let legacy_root = h._dir.path().join("old-local").join("Sothis");
+    let receipts = legacy_root.join("state").join("receipts");
+    fs::create_dir_all(&receipts).unwrap();
+    fs::write(receipts.join("amt.json"), "{\"legacy\":true}").unwrap();
+    h.legacy_root = Some(legacy_root.clone());
+    let summary = h.install("core");
+    assert!(summary.ok, "{:#?}", summary.items);
+    let note = summary
+        .warnings
+        .iter()
+        .find(|w| w.contains("v0.1.0 install exists"))
+        .unwrap_or_else(|| panic!("no legacy warning in {:?}", summary.warnings));
+    assert!(note.contains(&legacy_root.display().to_string()));
+    assert!(note.contains("sothis uninstall --profile"));
+    assert!(note.contains("--no-modify-path"));
+    // Nothing at the old root was touched and nothing was adopted from it.
+    assert_eq!(
+        fs::read_to_string(receipts.join("amt.json")).unwrap(),
+        "{\"legacy\":true}"
+    );
+    assert!(h.receipt("ametrite").is_some());
+    assert!(!h.layout.root.starts_with(&legacy_root));
+}
+
+#[test]
+fn no_legacy_note_without_receipts_or_when_the_legacy_root_is_the_root() {
+    let mut h = Harness::new();
+    let legacy_root = h._dir.path().join("old-local").join("Sothis");
+    fs::create_dir_all(legacy_root.join("state").join("receipts")).unwrap();
+    h.legacy_root = Some(legacy_root);
+    let summary = h.install("core");
+    assert!(summary.warnings.iter().all(|w| !w.contains("v0.1.0")));
+
+    // SOTHIS_HOME pointed at the old root: its receipts are the live ones.
+    let mut same = Harness::new();
+    assert!(same.install("core").ok);
+    same.legacy_root = Some(same.layout.root.clone());
+    let summary = same.run(&opts(Operation::Update, "core")).unwrap();
+    assert!(summary
+        .warnings
+        .iter()
+        .all(|w| !w.contains("v0.1.0 install exists")));
+}
+
+// ------------------------------------------------------------ plugin refresh
+
+impl Harness {
+    /// Pretend Claude Code has these `name@marketplace` plugins installed.
+    fn set_installed_plugins(&self, ids: &[&str]) {
+        let plugins = ids
+            .iter()
+            .map(|id| format!("\"{id}\":[{{\"scope\":\"user\"}}]"))
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(
+            self.plugin_dir.join("installed_plugins.json"),
+            format!("{{\"version\":2,\"plugins\":{{{plugins}}}}}"),
+        )
+        .unwrap();
+        fs::write(
+            self.plugin_dir.join("known_marketplaces.json"),
+            "{\"sothis\":{\"source\":{}}}",
+        )
+        .unwrap();
+    }
+
+    fn claude_calls(&self) -> Vec<String> {
+        self.claude.calls.borrow().clone()
+    }
+}
+
+const SUITE_PLUGINS: [&str; 4] = [
+    "hayvenhurst@sothis",
+    "sirius@sothis",
+    "catryna@sothis",
+    "sothis@sothis",
+];
+
+fn plugin_update_opts() -> Options {
+    let mut options = opts(Operation::Update, "core");
+    options.plugins = true;
+    options
+}
+
+#[test]
+fn update_refreshes_the_marketplace_once_then_each_installed_plugin() {
+    let mut h = Harness::new();
+    h.install("core");
+    h.set_installed_plugins(&SUITE_PLUGINS);
+    h.claude.outputs = vec![
+        (
+            "update hayvenhurst@sothis",
+            "Plugin \"hayvenhurst\" updated from 0.0.9 to 0.0.10. Restart to apply changes.",
+        ),
+        (
+            "update sirius@sothis",
+            "sirius is already at the latest version (0.2.7).",
+        ),
+    ];
+    let summary = h.run(&plugin_update_opts()).unwrap();
+    assert!(summary.ok, "{}", summary.render_human());
+    let calls = h.claude_calls();
+    assert_eq!(calls[0], "plugin marketplace update sothis");
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.contains("marketplace update"))
+            .count(),
+        1,
+        "{calls:?}"
+    );
+    for id in SUITE_PLUGINS {
+        assert!(
+            calls.contains(&format!("plugin update {id}")),
+            "{id} in {calls:?}"
+        );
+    }
+    assert_eq!(calls.len(), 1 + SUITE_PLUGINS.len(), "{calls:?}");
+    assert!(
+        !calls.iter().any(|call| call.contains("install")),
+        "an installed plugin is never reinstalled: {calls:?}"
+    );
+    let hayven = item(&summary, "hayvenhurst", "update_plugin");
+    assert_eq!(hayven.result, "updated");
+    assert!(hayven.detail.contains("0.0.9 to 0.0.10"));
+    assert_eq!(
+        item(&summary, "sirius-forester", "update_plugin").result,
+        "up-to-date"
+    );
+    assert_eq!(
+        item(&summary, "sothis", "update_marketplace").result,
+        "updated"
+    );
+    // The install-time "already installed" line is not repeated by update.
+    assert!(summary.items.iter().all(|i| i.action != "install_plugin"));
+}
+
+#[test]
+fn a_failing_plugin_update_is_reported_without_failing_the_binary_updates() {
+    let mut h = Harness::new();
+    h.set_version("hayvenhurst", "0.0.8");
+    h.publish("hayvenhurst", "0.0.8");
+    h.install("core");
+    h.set_version("hayvenhurst", "0.0.9");
+    h.publish("hayvenhurst", "0.0.9");
+    h.set_installed_plugins(&SUITE_PLUGINS);
+    h.claude.fail_on = Some("plugin update sirius@sothis");
+    let summary = h.run(&plugin_update_opts()).unwrap();
+    // The binary updated, and its own result is untouched by the plugin failure.
+    let binary = item(&summary, "hayvenhurst", "check_for_update");
+    assert_eq!(binary.result, "updated");
+    assert!(!binary.failed);
+    assert_eq!(h.bin_text("hayven.exe"), "hayven 0.0.9");
+    // The failure is its own failed step, and the other plugins still ran.
+    let failed = item(&summary, "sirius-forester", "update_plugin");
+    assert!(failed.failed);
+    assert_eq!(failed.result, "failed");
+    assert!(failed.detail.contains("sirius@sothis"));
+    assert!(!summary.ok);
+    assert!(h
+        .claude_calls()
+        .contains(&"plugin update sothis@sothis".to_string()));
+    assert!(!item(&summary, "hayvenhurst", "update_plugin").failed);
+}
+
+#[test]
+fn a_failed_marketplace_refresh_skips_the_plugin_updates() {
+    let mut h = Harness::new();
+    h.install("core");
+    h.set_installed_plugins(&SUITE_PLUGINS);
+    h.claude.fail_on = Some("marketplace update");
+    let summary = h.run(&plugin_update_opts()).unwrap();
+    assert!(!summary.ok);
+    let failed = item(&summary, "sothis", "update_marketplace");
+    assert!(failed.failed);
+    assert_eq!(h.claude_calls(), ["plugin marketplace update sothis"]);
+    assert!(summary.items.iter().all(|i| i.action != "update_plugin"));
+}
+
+#[test]
+fn no_plugins_skips_every_plugin_step_on_update() {
+    let mut h = Harness::new();
+    h.install("core");
+    h.set_installed_plugins(&SUITE_PLUGINS);
+    let summary = h.run(&opts(Operation::Update, "core")).unwrap();
+    assert!(summary.ok);
+    assert!(h.claude_calls().is_empty());
+    assert!(summary.items.iter().all(|i| !i.action.contains("plugin")));
+}
+
+#[test]
+fn update_installs_a_missing_plugin_but_does_not_also_update_it() {
+    let mut h = Harness::new();
+    h.install("core");
+    h.set_installed_plugins(&["sirius@sothis"]);
+    let summary = h.run(&plugin_update_opts()).unwrap();
+    assert!(summary.ok, "{}", summary.render_human());
+    let calls = h.claude_calls();
+    assert!(calls.contains(&"plugin install hayvenhurst@sothis".to_string()));
+    assert!(calls.contains(&"plugin update sirius@sothis".to_string()));
+    assert!(
+        !calls.contains(&"plugin update hayvenhurst@sothis".to_string()),
+        "just installed, so not updated: {calls:?}"
+    );
+    assert_eq!(
+        item(&summary, "hayvenhurst", "install_plugin").result,
+        "installed"
+    );
+}
+
+#[test]
+fn update_without_any_installed_plugin_runs_no_refresh() {
+    let mut h = Harness::new();
+    h.install("core");
+    h.claude.fail_on = Some("never matches");
+    let summary = h.run(&plugin_update_opts()).unwrap();
+    assert!(summary.ok);
+    assert!(!h
+        .claude_calls()
+        .iter()
+        .any(|call| call.contains("marketplace update") || call.contains("plugin update")));
+}
+
+#[test]
+fn update_without_the_claude_cli_reports_the_exact_commands() {
+    let mut h = Harness::new();
+    h.install("core");
+    h.set_installed_plugins(&["sirius@sothis"]);
+    h.claude = FakeClaude::new(false);
+    let summary = h.run(&plugin_update_opts()).unwrap();
+    assert!(summary.ok);
+    let manual = item(&summary, "sothis", "update_plugin");
+    assert_eq!(manual.result, "manual");
+    assert!(manual
+        .detail
+        .contains("claude plugin marketplace update sothis && claude plugin update sirius@sothis"));
+}
+
+#[test]
+fn install_keeps_install_semantics_and_points_at_update_for_installed_plugins() {
+    let mut h = Harness::new();
+    h.set_installed_plugins(&["sirius@sothis"]);
+    let mut options = opts(Operation::Install, "core");
+    options.plugins = true;
+    let summary = h.run(&options).unwrap();
+    assert!(summary.ok);
+    let existing = item(&summary, "sirius-forester", "install_plugin");
+    assert_eq!(existing.result, "already-installed");
+    assert!(existing
+        .detail
+        .contains("run `sothis update` to refresh it"));
+    assert!(
+        h.claude_calls().iter().all(|call| !call.contains("update")),
+        "install never updates plugins: {:?}",
+        h.claude_calls()
+    );
+    assert!(summary
+        .items
+        .iter()
+        .all(|i| i.action != "update_plugin" && i.action != "update_marketplace"));
 }

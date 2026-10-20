@@ -245,6 +245,10 @@ fn env_for(command: &mut Command, setup: &Setup<'_>, slash: bool) {
     let (platform, _) = platform();
     command
         .env("SOTHIS_HOME", text(setup.home))
+        // The temp homes below can sit under AppData, which is virtualized when
+        // the shell was started by the Claude desktop app; these scenarios are
+        // not about that (the refusal has its own test).
+        .env("SOTHIS_ALLOW_VIRTUALIZED_ROOT", "1")
         .env("SOTHIS_BOOTSTRAP_MIRROR", text(&setup.release.mirror))
         .env("SOTHIS_BOOTSTRAP_PLATFORM", platform)
         .env_remove("SOTHIS_RELEASE_MIRROR");
@@ -723,4 +727,200 @@ fn ps1_hand_off_survives_a_caller_that_redirects_stderr() {
 fn ps1_usage_errors_exit_one_with_a_message() {
     // `-File` turns a failed bootstrap into exit 1 (the script owns its process).
     scenario_usage_errors(run_ps1, &PS1, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Default root (no SOTHIS_HOME): %USERPROFILE%\.sothis on Windows, ~/.local/bin
+// elsewhere. Never %LOCALAPPDATA%: processes started by the Claude desktop
+// app have their writes there silently redirected.
+//
+// SAFETY: USERPROFILE/HOME/LOCALAPPDATA/APPDATA all point into a temp dir.
+
+struct DefaultRoot {
+    profile: PathBuf,
+    local: PathBuf,
+}
+
+fn default_root_env(
+    command: &mut Command,
+    release: &Release,
+    cosign: &Path,
+    dirs: &DefaultRoot,
+    slash: bool,
+) {
+    let text = |path: &Path| {
+        if slash {
+            slashed(path)
+        } else {
+            path.to_string_lossy().into_owned()
+        }
+    };
+    let (platform, _) = platform();
+    command
+        .env_remove("SOTHIS_HOME")
+        .env_remove("SOTHIS_ALLOW_VIRTUALIZED_ROOT")
+        .env_remove("SOTHIS_RELEASE_MIRROR")
+        .env("USERPROFILE", text(&dirs.profile))
+        .env("HOME", text(&dirs.profile))
+        .env("LOCALAPPDATA", text(&dirs.local))
+        .env("APPDATA", text(&dirs.local.join("Roaming")))
+        .env("SOTHIS_BOOTSTRAP_MIRROR", text(&release.mirror))
+        .env("SOTHIS_BOOTSTRAP_PLATFORM", platform)
+        .env("SOTHIS_COSIGN", text(cosign));
+}
+
+/// Where the script should have put sothis with no SOTHIS_HOME.
+fn default_bin(profile: &Path) -> PathBuf {
+    if cfg!(windows) {
+        profile.join(".sothis").join("bin")
+    } else {
+        profile.join(".local").join("bin")
+    }
+}
+
+#[test]
+fn sh_default_root_is_the_profile_not_appdata() {
+    if !sh_available() {
+        eprintln!("skipping: no `sh` on PATH");
+        return;
+    }
+    let temp = Temp::new("sh-default");
+    let release = make_release(&temp.0);
+    release.add_bundle();
+    let cosign = fake_cosign(&temp.0.join("cosign"), true, false);
+    let dirs = DefaultRoot {
+        profile: temp.0.join("profile"),
+        local: temp.0.join("profile").join("AppData").join("Local"),
+    };
+    fs::create_dir_all(&dirs.profile).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("install.sh");
+    let mut command = Command::new("sh");
+    command
+        .arg(slashed(&script))
+        .args(["--version", VERSION, "--no-install"]);
+    default_root_env(&mut command, &release, &cosign, &dirs, true);
+    let run = Run {
+        output: command.output().unwrap(),
+    };
+    assert_eq!(run.code(), 0, "{}", run.text());
+    assert!(
+        default_bin(&dirs.profile).join(exe_name()).is_file(),
+        "{}",
+        run.text()
+    );
+    assert!(
+        !dirs.local.join("Sothis").exists(),
+        "nothing may be written under LOCALAPPDATA"
+    );
+}
+
+#[cfg(windows)]
+fn ps1_command(release: &Release, cosign: &Path, dirs: &DefaultRoot, args: &[&str]) -> Command {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("install.ps1");
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .args(args);
+    default_root_env(&mut command, release, cosign, dirs, false);
+    command
+}
+
+#[cfg(windows)]
+#[test]
+fn ps1_default_root_is_the_profile_not_appdata() {
+    let temp = Temp::new("ps1-default");
+    let release = make_release(&temp.0);
+    release.add_bundle();
+    let cosign = fake_cosign(&temp.0.join("cosign"), true, true);
+    let dirs = DefaultRoot {
+        profile: temp.0.join("profile"),
+        local: temp.0.join("profile").join("AppData").join("Local"),
+    };
+    fs::create_dir_all(&dirs.local).unwrap();
+    let mut command = ps1_command(
+        &release,
+        &cosign,
+        &dirs,
+        &["-Version", VERSION, "-NoInstall"],
+    );
+    let run = Run {
+        output: command.output().unwrap(),
+    };
+    assert_eq!(run.code(), 0, "{}", run.text());
+    assert!(
+        default_bin(&dirs.profile).join(exe_name()).is_file(),
+        "{}",
+        run.text()
+    );
+    assert!(
+        !dirs.local.join("Sothis").exists(),
+        "nothing may be written under LOCALAPPDATA"
+    );
+}
+
+/// The real probe, end to end: a root under the real `%LOCALAPPDATA%` is
+/// placed when that directory is not virtualized, and refused (nothing
+/// installed) when it is, e.g. in a shell started by the Claude desktop app.
+/// `-AllowVirtualizedRoot` always places it. The scratch directory is uniquely
+/// named and deleted.
+#[cfg(windows)]
+#[test]
+fn ps1_probes_an_appdata_root_and_refuses_only_a_virtualized_one() {
+    let temp = Temp::new("ps1-probe");
+    let release = make_release(&temp.0);
+    release.add_bundle();
+    let cosign = fake_cosign(&temp.0.join("cosign"), true, true);
+    let dirs = DefaultRoot {
+        profile: temp.0.join("profile"),
+        local: temp.0.join("profile").join("AppData").join("Local"),
+    };
+    let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+    let home = local.join(format!(
+        "sothis-bootstrap-probe-{}-{}",
+        std::process::id(),
+        temp.0.file_name().unwrap().to_string_lossy()
+    ));
+    let probe_run = |args: &[&str]| {
+        let mut command = ps1_command(&release, &cosign, &dirs, args);
+        command
+            .env("SOTHIS_HOME", &home)
+            .env("LOCALAPPDATA", &local)
+            .env("APPDATA", local.parent().unwrap().join("Roaming"));
+        Run {
+            output: command.output().unwrap(),
+        }
+    };
+
+    let first = probe_run(&["-Version", VERSION, "-NoInstall"]);
+    if first.code() == 0 {
+        assert!(
+            home.join("bin").join(exe_name()).is_file(),
+            "{}",
+            first.text()
+        );
+    } else {
+        assert_eq!(first.code(), 1, "{}", first.text());
+        assert!(
+            first.text().contains("refusing to place sothis"),
+            "{}",
+            first.text()
+        );
+        assert!(first.text().contains("Packages"), "{}", first.text());
+        assert!(
+            !home.join("bin").join(exe_name()).exists(),
+            "{}",
+            first.text()
+        );
+    }
+    let _ = fs::remove_dir_all(&home);
+
+    let allowed = probe_run(&["-Version", VERSION, "-NoInstall", "-AllowVirtualizedRoot"]);
+    assert_eq!(allowed.code(), 0, "{}", allowed.text());
+    assert!(home.join("bin").join(exe_name()).is_file());
+    let _ = fs::remove_dir_all(&home);
 }

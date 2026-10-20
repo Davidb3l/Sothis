@@ -2,10 +2,12 @@
 //! output. Everything of substance lives in [`crate::install::engine`].
 
 use crate::install::engine::{self, Context, Operation, Options, PathMode, RealProbe, Services};
-use crate::install::layout::Layout;
+use crate::install::layout::{EnvVars, Layout};
+use crate::install::legacy;
 use crate::install::plugins::RealClaude;
 use crate::install::source;
 use crate::install::verify::CosignVerifier;
+use crate::install::virtualized::{self, RealVirtualizationProbe, VirtualizationProbe};
 use crate::manifest::Manifest;
 use crate::platform::{HostOs, HostPlatform};
 use std::path::PathBuf;
@@ -19,6 +21,8 @@ type CliResult = Result<(), (i32, String)>;
 pub struct Parsed {
     pub options: Options,
     pub mirror: Option<PathBuf>,
+    /// `--allow-virtualized-root`: install even where the probe shows the root is virtualized.
+    pub allow_virtualized_root: bool,
 }
 
 fn flag(args: &[String], name: &str) -> Result<bool, (i32, String)> {
@@ -45,6 +49,7 @@ pub fn parse(
                 "--allow-downgrade",
                 "--no-modify-path",
                 "--no-plugins",
+                "--allow-virtualized-root",
             ],
             &["--profile", "--mirror"],
         ),
@@ -108,7 +113,48 @@ pub fn parse(
         },
         rollback_tool,
     };
-    Ok(Parsed { options, mirror })
+    Ok(Parsed {
+        options,
+        mirror,
+        allow_virtualized_root: flag(args, "--allow-virtualized-root")?,
+    })
+}
+
+/// The directories whose virtualization matters: the root, and the bin
+/// directory when it is not inside the root (macOS/Linux).
+pub fn probe_targets(layout: &Layout) -> Vec<&std::path::Path> {
+    let mut dirs = vec![layout.root.as_path()];
+    if !virtualized::is_under(&layout.bin, &layout.root) {
+        dirs.push(layout.bin.as_path());
+    }
+    dirs
+}
+
+/// Refuse to install or update into a root that Windows would silently
+/// virtualize (see [`crate::install::virtualized`]), unless explicitly
+/// allowed (`--allow-virtualized-root` or `SOTHIS_ALLOW_VIRTUALIZED_ROOT`).
+/// The probe runs before anything else is written (it creates and removes one
+/// uniquely named file). Uninstall and rollback stay possible so a v0.1.0
+/// install can still be removed.
+pub fn guard_virtualized_root(
+    operation: Operation,
+    allow: bool,
+    layout: &Layout,
+    probe: &dyn VirtualizationProbe,
+) -> CliResult {
+    if allow || !matches!(operation, Operation::Install | Operation::Update) {
+        return Ok(());
+    }
+    match virtualized::virtualized_problem(&probe_targets(layout), probe) {
+        Some(reason) => Err((
+            1,
+            format!(
+                "refusing to {}: {reason}. Nothing was installed. (Pass --allow-virtualized-root only if you know what you are doing.)",
+                operation.name()
+            ),
+        )),
+        None => Ok(()),
+    }
 }
 
 pub fn run_mutation(
@@ -132,7 +178,16 @@ pub fn run_mutation(
     }
 
     let host = HostPlatform::detect().map_err(|e| (1, e))?;
-    let layout = Layout::resolve(host).map_err(|e| (1, e))?;
+    let process_env = EnvVars::from_process();
+    let layout = Layout::resolve_from(host, &process_env).map_err(|e| (1, e))?;
+    let allow_virtualized = parsed.allow_virtualized_root
+        || std::env::var_os(virtualized::ALLOW_ENV).is_some_and(|value| !value.is_empty());
+    guard_virtualized_root(
+        operation,
+        allow_virtualized,
+        &layout,
+        &RealVirtualizationProbe,
+    )?;
     let env_mirror = std::env::var_os(MUTATION_ENV_MIRROR)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
@@ -161,6 +216,8 @@ pub fn run_mutation(
         } else {
             ""
         },
+        legacy_root: legacy::legacy_root(host, &process_env),
+        legacy_path_entries: legacy::legacy_path_entries(host, &process_env),
     };
     let services = Services {
         fetcher: fetcher.as_ref(),
@@ -246,6 +303,99 @@ mod tests {
         assert!(defaults.options.modify_path);
         assert!(defaults.options.plugins);
         assert!(!defaults.options.allow_missing_cosign);
+    }
+
+    #[test]
+    fn allow_virtualized_root_is_an_install_and_update_flag_only() {
+        let parsed = parse(
+            Operation::Install,
+            &args(&["--allow-virtualized-root"]),
+            &resolve,
+        )
+        .unwrap();
+        assert!(parsed.allow_virtualized_root);
+        assert!(
+            !parse(Operation::Update, &[], &resolve)
+                .unwrap()
+                .allow_virtualized_root
+        );
+        assert!(parse(
+            Operation::Uninstall,
+            &args(&["--allow-virtualized-root"]),
+            &resolve
+        )
+        .is_err());
+    }
+
+    fn abs(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\{}", path.replace('/', r"\")))
+        } else {
+            PathBuf::from(format!("/{path}"))
+        }
+    }
+
+    fn layout_at(root: PathBuf) -> Layout {
+        Layout {
+            bin: root.join("bin"),
+            root,
+        }
+    }
+
+    #[test]
+    fn a_virtualized_install_into_appdata_is_refused_unless_allowed() {
+        let probe = virtualized::FakeProbe::virtualizing(
+            abs("Users/t/AppData/Local"),
+            "Claude_pzs8sxrjxfjjc",
+        );
+        let layout = layout_at(abs("Users/t/AppData/Local/Sothis"));
+        for operation in [Operation::Install, Operation::Update] {
+            let (code, message) =
+                guard_virtualized_root(operation, false, &layout, &probe).unwrap_err();
+            assert_eq!(code, 1);
+            assert!(message.contains("Nothing was installed"), "{message}");
+            assert!(message.contains("Claude_pzs8sxrjxfjjc"), "{message}");
+            assert!(message.contains("--allow-virtualized-root"), "{message}");
+        }
+        let allowed = virtualized::FakeProbe::virtualizing(abs("Users/t/AppData/Local"), "P");
+        assert!(guard_virtualized_root(Operation::Install, true, &layout, &allowed).is_ok());
+        assert!(
+            allowed.probed.borrow().is_empty(),
+            "an allowed install does not even probe"
+        );
+        // Removing an old install stays possible, and needs no probe.
+        for operation in [Operation::Uninstall, Operation::Rollback] {
+            assert!(guard_virtualized_root(operation, false, &layout, &probe).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_guard_passes_for_a_direct_root_and_when_the_probe_is_unknown() {
+        let probe = virtualized::FakeProbe::virtualizing(abs("Users/t/AppData"), "P");
+        let safe = layout_at(abs("Users/t/.sothis"));
+        assert!(guard_virtualized_root(Operation::Install, false, &safe, &probe).is_ok());
+        assert_eq!(
+            *probe.probed.borrow(),
+            [abs("Users/t/.sothis")],
+            "root only"
+        );
+
+        let unknown = virtualized::FakeProbe {
+            unknown: true,
+            ..virtualized::FakeProbe::direct()
+        };
+        let appdata = layout_at(abs("Users/t/AppData/Roaming/x"));
+        assert!(guard_virtualized_root(Operation::Install, false, &appdata, &unknown).is_ok());
+    }
+
+    #[test]
+    fn a_bin_directory_outside_the_root_is_probed_too() {
+        let probe = virtualized::FakeProbe::virtualizing(abs("Users/t/AppData/Local/bin"), "P");
+        let layout = Layout {
+            root: abs("Users/t/.sothis"),
+            bin: abs("Users/t/AppData/Local/bin"),
+        };
+        assert!(guard_virtualized_root(Operation::Install, false, &layout, &probe).is_err());
     }
 
     #[test]

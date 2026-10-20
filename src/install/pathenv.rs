@@ -24,6 +24,8 @@ pub trait PathStore {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathChange {
+    /// Only produced by the test-only [`ensure_present`].
+    #[cfg_attr(not(test), allow(dead_code))]
     Added,
     Removed,
     Unchanged,
@@ -68,30 +70,84 @@ fn contains_entry(value: &str, bin: &str, expand: &dyn Fn(&str) -> Option<String
         .any(|part| normalize(part, expand) == wanted)
 }
 
+/// What [`ensure_present_migrating`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathUpdate {
+    /// `bin` was prepended.
+    pub added: bool,
+    /// At least one legacy entry was removed.
+    pub removed_legacy: bool,
+}
+
 /// Prepend `bin` to the user PATH when absent (idempotent, case-insensitive,
-/// trailing-slash tolerant). Preserves the registry value type.
+/// trailing-slash tolerant). Preserves the registry value type. The engine uses
+/// [`ensure_present_migrating`]; this is the plain form the tests exercise.
+#[cfg(test)]
 pub fn ensure_present(
     store: &mut dyn PathStore,
     bin: &Path,
     expand: &dyn Fn(&str) -> Option<String>,
 ) -> Result<PathChange, String> {
+    let update = ensure_present_migrating(store, bin, &[], expand)?;
+    Ok(if update.added {
+        PathChange::Added
+    } else {
+        PathChange::Unchanged
+    })
+}
+
+/// Like [`ensure_present`], and also drop the Sothis-owned `legacy` entries
+/// (exact matches only, in any spelling [`normalize`] equates; an entry that
+/// equals `bin` itself is never "legacy"). Nothing else is touched. One write
+/// at most, and none when there is nothing to do.
+pub fn ensure_present_migrating(
+    store: &mut dyn PathStore,
+    bin: &Path,
+    legacy: &[String],
+    expand: &dyn Fn(&str) -> Option<String>,
+) -> Result<PathUpdate, String> {
     let bin = bin.to_string_lossy().into_owned();
     let existing = store.read()?;
     let (current, expandable) = match &existing {
         Some(value) => (value.value.clone(), value.expandable),
         None => (String::new(), true),
     };
-    if contains_entry(&current, &bin, expand) {
-        return Ok(PathChange::Unchanged);
+    let wanted = normalize(&bin, expand);
+    let legacy = legacy
+        .iter()
+        .map(|entry| normalize(entry, expand))
+        .filter(|entry| *entry != wanted)
+        .collect::<Vec<_>>();
+    let mut kept = Vec::new();
+    let mut removed_legacy = false;
+    for part in current.split(SEPARATOR) {
+        if !part.trim().is_empty() && legacy.contains(&normalize(part, expand)) {
+            removed_legacy = true;
+        } else {
+            kept.push(part);
+        }
     }
-    let value = if current.trim().is_empty() {
+    let kept = kept.join(&SEPARATOR.to_string());
+    let added = !contains_entry(&kept, &bin, expand);
+    if !added && !removed_legacy {
+        return Ok(PathUpdate {
+            added: false,
+            removed_legacy: false,
+        });
+    }
+    let value = if !added {
+        kept
+    } else if kept.trim().is_empty() {
         bin
     } else {
-        format!("{bin}{SEPARATOR}{current}")
+        format!("{bin}{SEPARATOR}{kept}")
     };
     store.write(&PathValue { value, expandable })?;
     store.broadcast_change().ok(); // best effort; new processes read the registry anyway
-    Ok(PathChange::Added)
+    Ok(PathUpdate {
+        added,
+        removed_legacy,
+    })
 }
 
 /// Remove every entry equal to `bin` from the user PATH.
@@ -389,6 +445,160 @@ mod tests {
             PathChange::Unchanged
         );
         assert_eq!(fake.writes, 1, "the second call must not write");
+    }
+
+    fn legacy_entries() -> Vec<String> {
+        vec![
+            r"%LOCALAPPDATA%\Sothis\bin".to_string(),
+            r"C:\Users\t\AppData\Local\Sothis\bin".to_string(),
+        ]
+    }
+
+    const NEW_BIN: &str = r"C:\Users\t\.sothis\bin";
+
+    fn local_expand(name: &str) -> Option<String> {
+        name.eq_ignore_ascii_case("LOCALAPPDATA")
+            .then(|| r"C:\Users\t\AppData\Local".to_string())
+    }
+
+    #[test]
+    fn migration_replaces_the_legacy_entry_with_the_new_bin() {
+        let mut fake = store(
+            r"C:\Windows;C:\Users\t\AppData\Local\Sothis\bin;C:\Tools",
+            true,
+        );
+        let update = ensure_present_migrating(
+            &mut fake,
+            Path::new(NEW_BIN),
+            &legacy_entries(),
+            &local_expand,
+        )
+        .unwrap();
+        assert_eq!(
+            update,
+            PathUpdate {
+                added: true,
+                removed_legacy: true
+            }
+        );
+        assert_eq!(
+            fake.value.as_ref().unwrap().value,
+            format!(r"{NEW_BIN};C:\Windows;C:\Tools")
+        );
+        assert_eq!((fake.writes, fake.broadcasts), (1, 1));
+        // Idempotent: a second run changes nothing and does not write.
+        let again = ensure_present_migrating(
+            &mut fake,
+            Path::new(NEW_BIN),
+            &legacy_entries(),
+            &local_expand,
+        )
+        .unwrap();
+        assert!(!again.added && !again.removed_legacy);
+        assert_eq!(fake.writes, 1);
+    }
+
+    #[test]
+    fn migration_matches_every_spelling_of_the_legacy_entry() {
+        for spelling in [
+            r"%LOCALAPPDATA%\Sothis\bin",
+            r"%localappdata%\sothis\BIN\",
+            r"C:\Users\t\AppData\Local\Sothis\bin",
+            r"c:/users/T/appdata/local/sothis/bin/",
+            r" C:\Users\t\AppData\Local\Sothis\bin ",
+        ] {
+            for expand in [&local_expand as &dyn Fn(&str) -> Option<String>, &no_env] {
+                let mut fake = store(&format!(r"C:\keep;{spelling};D:\also"), false);
+                let update = ensure_present_migrating(
+                    &mut fake,
+                    Path::new(NEW_BIN),
+                    &legacy_entries(),
+                    expand,
+                )
+                .unwrap();
+                assert!(update.removed_legacy, "{spelling}");
+                assert_eq!(
+                    fake.value,
+                    Some(PathValue {
+                        value: format!(r"{NEW_BIN};C:\keep;D:\also"),
+                        expandable: false
+                    }),
+                    "{spelling}: value type preserved, neighbours untouched"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn migration_leaves_unrelated_entries_alone() {
+        let before = r"C:\Users\t\AppData\Local\Sothis\bin2;C:\Users\t\AppData\Local\Sothis;C:\Users\t\AppData\Local\Sothis\bin\sub;C:\Users\other\AppData\Local\Sothis\bin;%NOPE%\Sothis\bin";
+        let mut fake = store(before, true);
+        let update = ensure_present_migrating(
+            &mut fake,
+            Path::new(NEW_BIN),
+            &legacy_entries(),
+            &local_expand,
+        )
+        .unwrap();
+        assert!(update.added && !update.removed_legacy);
+        assert_eq!(
+            fake.value.as_ref().unwrap().value,
+            format!("{NEW_BIN};{before}")
+        );
+    }
+
+    #[test]
+    fn migration_when_the_new_bin_is_already_present_only_removes_the_legacy_entry() {
+        let mut fake = store(&format!(r"{NEW_BIN};%LOCALAPPDATA%\Sothis\bin;C:\x"), true);
+        let update = ensure_present_migrating(
+            &mut fake,
+            Path::new(NEW_BIN),
+            &legacy_entries(),
+            &local_expand,
+        )
+        .unwrap();
+        assert_eq!(
+            update,
+            PathUpdate {
+                added: false,
+                removed_legacy: true
+            }
+        );
+        assert_eq!(
+            fake.value.as_ref().unwrap().value,
+            format!(r"{NEW_BIN};C:\x")
+        );
+        assert!(fake.value.as_ref().unwrap().expandable);
+    }
+
+    #[test]
+    fn a_legacy_entry_equal_to_the_new_bin_is_not_removed() {
+        // SOTHIS_HOME pointed at the old root: the "legacy" bin is the new bin.
+        let old_bin = r"C:\Users\t\AppData\Local\Sothis\bin";
+        let mut fake = store(&format!(r"C:\x;{old_bin}"), true);
+        let update = ensure_present_migrating(
+            &mut fake,
+            Path::new(old_bin),
+            &legacy_entries(),
+            &local_expand,
+        )
+        .unwrap();
+        assert!(!update.added && !update.removed_legacy);
+        assert_eq!(fake.writes, 0);
+    }
+
+    #[test]
+    fn migration_into_a_missing_value_creates_it_expandable() {
+        let mut empty = FakeStore::default();
+        ensure_present_migrating(&mut empty, Path::new(NEW_BIN), &legacy_entries(), &no_env)
+            .unwrap();
+        assert_eq!(
+            empty.value,
+            Some(PathValue {
+                value: NEW_BIN.to_string(),
+                expandable: true
+            })
+        );
     }
 
     #[test]

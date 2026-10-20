@@ -33,6 +33,10 @@ fn sothis(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sothis"))
         .args(args)
         .env("SOTHIS_HOME", home)
+        // These tests install into temp directories, which on a machine where
+        // the shell itself is virtualized (the Claude desktop app) would be
+        // refused; the refusal has its own tests.
+        .env("SOTHIS_ALLOW_VIRTUALIZED_ROOT", "1")
         .env_remove("SOTHIS_RELEASE_MIRROR")
         .env_remove("SOTHIS_COSIGN")
         .output()
@@ -337,4 +341,167 @@ fn real_release_assets_install_verify_idempotency_tamper_and_uninstall() {
         .unwrap()
         .contains("sha256 mismatch"));
     assert!(!home.join("bin").join("hayven.exe").exists());
+}
+
+// ------------------------------------------------ virtualized roots
+//
+// The refusal itself is covered with a fake probe in the unit tests (the real
+// probe needs a virtualized process). Here the real binary runs the real probe
+// against a directory under %USERPROFILE%, which is never virtualized.
+
+#[cfg(windows)]
+fn profile_scratch(label: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(format!(
+        ".sothis-cli-{label}-{}-{nonce}",
+        std::process::id()
+    ))
+}
+
+#[cfg(windows)]
+fn check<'a>(report: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    report["checks"]
+        .as_array()?
+        .iter()
+        .find(|check| check["name"] == name)
+}
+
+#[cfg(windows)]
+#[test]
+fn doctor_probes_a_profile_root_and_passes_root_not_virtualized() {
+    let home = profile_scratch("doctor");
+    let output = Command::new(env!("CARGO_BIN_EXE_sothis"))
+        .args(["doctor", "--profile", "bell", "--json"])
+        .env("SOTHIS_HOME", &home)
+        .output()
+        .unwrap();
+    let existed = home.exists();
+    let report = json(&output);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(
+        check(&report, "root_not_virtualized").expect("the probe check")["status"],
+        "pass"
+    );
+    assert!(
+        !existed,
+        "doctor probes through an ancestor and creates no root"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn an_install_into_a_profile_root_is_not_refused_without_any_allow_flag() {
+    let home = profile_scratch("install");
+    let mirror = home.with_extension("mirror");
+    fs::create_dir_all(&mirror).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sothis"))
+        .args([
+            "install",
+            "--profile",
+            "core",
+            "--no-modify-path",
+            "--no-plugins",
+            "--mirror",
+            mirror.to_str().unwrap(),
+        ])
+        .env("SOTHIS_HOME", &home)
+        .env_remove("SOTHIS_ALLOW_VIRTUALIZED_ROOT")
+        .env_remove("SOTHIS_RELEASE_MIRROR")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&mirror);
+    assert!(!text.contains("refusing to install"), "{text}");
+    assert!(text.contains("missing from the mirror"), "{text}");
+}
+
+#[cfg(windows)]
+#[test]
+fn env_defaults_to_dot_sothis_in_the_profile_not_localappdata() {
+    let temp = Temp::new("env-default");
+    let profile = temp.0.join("profile");
+    let local = temp.0.join("profile").join("AppData").join("Local");
+    let output = Command::new(env!("CARGO_BIN_EXE_sothis"))
+        .args(["env", "--json"])
+        .env_remove("SOTHIS_HOME")
+        .env("USERPROFILE", &profile)
+        .env("HOME", &profile)
+        .env("LOCALAPPDATA", &local)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let value = json(&output);
+    assert_eq!(
+        value["root"],
+        profile.join(".sothis").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        value["installDir"],
+        profile
+            .join(".sothis")
+            .join("bin")
+            .to_string_lossy()
+            .as_ref()
+    );
+}
+
+#[test]
+fn update_plan_lists_the_plugin_update_steps() {
+    let temp = Temp::new("plan-plugins");
+    let plugins = temp.0.join("plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    fs::write(
+        plugins.join("installed_plugins.json"),
+        r#"{"version":2,"plugins":{"sirius@sothis":[{"scope":"user"}],"sirius@sirius-forester":[{}]}}"#,
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_sothis"))
+            .args(args)
+            .env("SOTHIS_HOME", temp.0.join("home"))
+            .env("CLAUDE_PLUGINS_DIR", &plugins)
+            .output()
+            .unwrap()
+    };
+    let output = run(&["update", "--plan", "--profile", "core", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let steps = json(&output)["pluginSteps"].clone();
+    assert_eq!(
+        steps,
+        serde_json::json!([
+            "claude plugin marketplace update sothis",
+            "claude plugin update sirius@sothis"
+        ])
+    );
+
+    let human = run(&["update", "--plan", "--profile", "core"]);
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("plugin steps:"), "{text}");
+    assert!(
+        text.contains("claude plugin update sirius@sothis"),
+        "{text}"
+    );
+    assert!(text.contains("no machine state changed"), "{text}");
+
+    let skipped = run(&[
+        "update",
+        "--plan",
+        "--profile",
+        "core",
+        "--no-plugins",
+        "--json",
+    ]);
+    assert_eq!(json(&skipped)["pluginSteps"], serde_json::json!([]));
+    // Install plans do not list plugin updates.
+    let install = run(&["install", "--plan", "--profile", "core", "--json"]);
+    assert_eq!(json(&install)["pluginSteps"], serde_json::json!([]));
+    assert!(!temp.0.join("home").exists(), "a plan writes nothing");
 }

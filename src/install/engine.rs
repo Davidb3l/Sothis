@@ -8,6 +8,7 @@
 use crate::install::extract;
 use crate::install::fsx;
 use crate::install::layout::Layout;
+use crate::install::legacy;
 use crate::install::lock::MutationLock;
 use crate::install::pathenv::{self, PathChange, PathStore};
 use crate::install::place::{self, Journal, PlaceInput};
@@ -68,6 +69,10 @@ pub struct Context<'a> {
     pub platform: &'a str,
     /// `.exe` on Windows, empty elsewhere.
     pub exe_suffix: &'a str,
+    /// The v0.1.0 root (`%LOCALAPPDATA%\Sothis`), Windows only.
+    pub legacy_root: Option<PathBuf>,
+    /// Spellings of the v0.1.0 bin directory to migrate off the user PATH.
+    pub legacy_path_entries: Vec<String>,
 }
 
 /// Runs an installed executable's `--version`.
@@ -195,6 +200,7 @@ pub fn run<'a>(
         items: Vec::new(),
         warnings: Vec::new(),
         path_changed: false,
+        plugins_installed_now: Vec::new(),
     };
     engine.cleanup_stale_scratch()?;
     match opts.operation {
@@ -212,6 +218,17 @@ struct Engine<'a> {
     items: Vec<ItemResult>,
     warnings: Vec<String>,
     path_changed: bool,
+    /// `name@marketplace` ids this run installed, so the update step does not
+    /// immediately "update" what was just installed.
+    plugins_installed_now: Vec<String>,
+}
+
+/// Plugin steps are not tool installs: they never count as a managed tool.
+fn is_plugin_step(action: &str) -> bool {
+    matches!(
+        action,
+        "install_plugin" | "update_plugin" | "update_marketplace"
+    )
 }
 
 fn find_tool<'m>(manifest: &'m Manifest, id: &str) -> Result<&'m Tool, String> {
@@ -233,6 +250,7 @@ fn is_success(result: &str) -> bool {
             | "newer-installed"
             | "up-to-date"
             | "updated"
+            | "checked"
     )
 }
 
@@ -333,16 +351,32 @@ impl Engine<'_> {
         }
         if self.opts.plugins {
             self.ensure_suite_plugin();
+            if operation == Operation::Update {
+                self.update_plugins();
+            }
         }
         let any_managed = self
             .items
             .iter()
-            .any(|item| item.action != "install_plugin" && is_success(&item.result));
+            .any(|item| !is_plugin_step(&item.action) && is_success(&item.result));
         if any_managed {
             self.path_step();
             self.shadow_warnings();
         }
+        self.legacy_root_note();
         Ok(())
+    }
+
+    /// A v0.1.0 install at the old root is reported, never adopted or deleted.
+    fn legacy_root_note(&mut self) {
+        let Some(legacy) = &self.ctx.legacy_root else {
+            return;
+        };
+        let root = &self.ctx.layout.root;
+        if pathenv::same_dir(legacy, root) || !legacy::receipts_present(legacy) {
+            return;
+        }
+        self.warnings.push(legacy::note(legacy, root));
     }
 
     fn manual_item(&mut self, tool: &Tool, item: &PlanItem, action: &str, result: &str) {
@@ -358,6 +392,57 @@ impl Engine<'_> {
             detail.push_str(&format!(" See https://github.com/{}.", tool.repository));
         }
         self.push(&tool.id, action, result, None, detail, false);
+    }
+
+    /// `sothis update`: refresh the marketplace catalog once, then update each
+    /// installed canonical suite plugin. A failure here is reported as a failed
+    /// step and never touches the binary results above it.
+    fn update_plugins(&mut self) {
+        let state = self.plugin_state();
+        let targets = plugins::update_targets(self.ctx.manifest, &state)
+            .into_iter()
+            .filter(|target| !self.plugins_installed_now.contains(&target.id()))
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return;
+        }
+        let marketplace = self.ctx.manifest.marketplace.canonical.name.clone();
+        if !self.svc.claude.is_available() {
+            let commands = plugins::update_commands(&marketplace, &targets).join(" && ");
+            self.push(
+                "sothis",
+                "update_plugin",
+                "manual",
+                None,
+                format!("the claude CLI is not on PATH; run: {commands}"),
+                false,
+            );
+            return;
+        }
+        let refreshed = plugins::update_marketplace(&marketplace, self.svc.claude);
+        let failed = refreshed.failed;
+        self.push(
+            "sothis",
+            "update_marketplace",
+            refreshed.result,
+            None,
+            refreshed.detail,
+            refreshed.failed,
+        );
+        if failed {
+            return;
+        }
+        for target in targets {
+            let step = plugins::update_plugin(&target, self.svc.claude);
+            self.push(
+                &target.tool,
+                "update_plugin",
+                step.result,
+                None,
+                step.detail,
+                step.failed,
+            );
+        }
     }
 
     fn runtime_item(&mut self, tool: &Tool, action: &str) {
@@ -391,12 +476,23 @@ impl Engine<'_> {
     fn ensure_tool_plugin(&mut self, tool: &Tool) {
         let Some(plugin) = &tool.plugin else { return };
         let state = self.plugin_state();
+        if self.opts.operation == Operation::Update
+            && state
+                .installed
+                .contains(&format!("{}@{}", plugin.name, plugin.marketplace))
+        {
+            // `update` refreshes installed plugins in `update_plugins`.
+            return;
+        }
         let target = PluginTarget {
             name: &plugin.name,
             marketplace: &plugin.marketplace,
             marketplace_repo: &self.ctx.manifest.marketplace.canonical.repository,
         };
         let step = plugins::ensure_plugin(&target, &state, self.svc.claude);
+        if step.result == "installed" {
+            self.plugins_installed_now.push(target.id());
+        }
         self.push(
             &tool.id,
             "install_plugin",
@@ -414,7 +510,13 @@ impl Engine<'_> {
             marketplace: &self.ctx.manifest.marketplace.canonical.name,
             marketplace_repo: &self.ctx.manifest.marketplace.canonical.repository,
         };
+        if self.opts.operation == Operation::Update && state.installed.contains(&target.id()) {
+            return;
+        }
         let step = plugins::ensure_plugin(&target, &state, self.svc.claude);
+        if step.result == "installed" {
+            self.plugins_installed_now.push(target.id());
+        }
         self.push(
             "sothis",
             "install_plugin",
@@ -1154,37 +1256,56 @@ impl Engine<'_> {
         let modify = self.opts.modify_path;
         let on_path = pathenv::dir_on_path(&bin, &self.svc.path_dirs);
         let expand = self.svc.expand_env;
+        let legacy_entries = self.ctx.legacy_path_entries.clone();
         match &mut self.svc.path {
-            PathMode::Store(store) if modify => match pathenv::ensure_present(*store, &bin, expand)
-            {
-                Ok(PathChange::Added) => {
-                    self.path_changed = true;
-                    self.warnings.push(format!(
-                        "added {} to the user PATH. {}",
-                        bin.display(),
-                        pathenv::NEW_PROCESS_NOTE
-                    ));
-                }
-                Ok(_) => {
-                    if !on_path {
-                        self.warnings.push(format!(
-                            "{} is already on the user PATH. {}",
-                            bin.display(),
-                            pathenv::NEW_PROCESS_NOTE
-                        ));
+            PathMode::Store(store) if modify => {
+                match pathenv::ensure_present_migrating(*store, &bin, &legacy_entries, expand) {
+                    Ok(update) => {
+                        if update.removed_legacy {
+                            self.path_changed = true;
+                            self.items.push(ItemResult {
+                            tool: "sothis".to_string(),
+                            action: "migrate_path".to_string(),
+                            result: "migrated".to_string(),
+                            version: None,
+                            detail: format!(
+                                r"removed the v0.1.0 user PATH entry %LOCALAPPDATA%\Sothis\bin{}",
+                                if update.added {
+                                    format!(" and added {}", bin.display())
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                            failed: false,
+                        });
+                        }
+                        if update.added {
+                            self.path_changed = true;
+                            self.warnings.push(format!(
+                                "added {} to the user PATH. {}",
+                                bin.display(),
+                                pathenv::NEW_PROCESS_NOTE
+                            ));
+                        } else if !on_path && !update.removed_legacy {
+                            self.warnings.push(format!(
+                                "{} is already on the user PATH. {}",
+                                bin.display(),
+                                pathenv::NEW_PROCESS_NOTE
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        self.items.push(ItemResult {
+                            tool: "sothis".to_string(),
+                            action: "modify_path".to_string(),
+                            result: "failed".to_string(),
+                            version: None,
+                            detail: format!("could not update the user PATH: {error}"),
+                            failed: true,
+                        });
                     }
                 }
-                Err(error) => {
-                    self.items.push(ItemResult {
-                        tool: "sothis".to_string(),
-                        action: "modify_path".to_string(),
-                        result: "failed".to_string(),
-                        version: None,
-                        detail: format!("could not update the user PATH: {error}"),
-                        failed: true,
-                    });
-                }
-            },
+            }
             PathMode::Store(_) => {
                 if !on_path {
                     self.warnings.push(format!(
@@ -1253,7 +1374,7 @@ impl Engine<'_> {
         let installed = self
             .items
             .iter()
-            .filter(|item| item.action != "install_plugin" && is_success(&item.result))
+            .filter(|item| !is_plugin_step(&item.action) && is_success(&item.result))
             .map(|item| item.tool.clone())
             .collect::<Vec<_>>();
         for id in installed {

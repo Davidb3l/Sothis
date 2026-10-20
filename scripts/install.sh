@@ -14,6 +14,7 @@
 #                           fatal). Also passed to `sothis install`.
 #   --no-modify-path        Passed to `sothis install`
 #   --no-plugins            Passed to `sothis install`
+#   --allow-virtualized-root  Passed to `sothis install` (see the note below)
 #   -h, --help              This text
 #
 # What it verifies, in order, before anything is unpacked: the download's
@@ -22,7 +23,10 @@
 # at the release tag. A missing cosign is fatal unless --allow-missing-cosign.
 #
 # Where sothis goes (the same directory `sothis env` reports):
-#   Windows (Git Bash/MSYS)  %LOCALAPPDATA%\Sothis\bin
+#   Windows (Git Bash/MSYS)  %USERPROFILE%\.sothis\bin
+#                            (not %LOCALAPPDATA%: processes started by the Claude desktop app
+#                            have their writes under AppData redirected into a private
+#                            folder, so an install there is invisible to everything else)
 #   $SOTHIS_HOME set         $SOTHIS_HOME/bin
 #   macOS / Linux            ~/.local/bin
 #
@@ -72,6 +76,7 @@ Usage: install.sh [options]
                           (a cosign that runs and fails is always fatal)
   --no-modify-path        Passed to `sothis install`
   --no-plugins            Passed to `sothis install`
+  --allow-virtualized-root  Passed to `sothis install`
   -h, --help              This text
 
 Verifies the sha256 and the Sigstore signature before unpacking anything.
@@ -85,6 +90,7 @@ NO_INSTALL=0
 ALLOW_MISSING_COSIGN=0
 NO_MODIFY_PATH=0
 NO_PLUGINS=0
+ALLOW_VIRTUALIZED=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -110,6 +116,7 @@ while [ $# -gt 0 ]; do
     --allow-missing-cosign) ALLOW_MISSING_COSIGN=1; shift ;;
     --no-modify-path) NO_MODIFY_PATH=1; shift ;;
     --no-plugins) NO_PLUGINS=1; shift ;;
+    --allow-virtualized-root) ALLOW_VIRTUALIZED=1; shift ;;
     -h | --help)
       show_help
       exit 0
@@ -381,11 +388,13 @@ if [ -n "${SOTHIS_HOME:-}" ]; then
   esac
   BIN_DIR="${SOTHIS_HOME%/}/bin"
 elif [ "$PLATFORM" = "windows-x64" ]; then
-  [ -n "${LOCALAPPDATA:-}" ] || die "LOCALAPPDATA is not set"
+  # %USERPROFILE%\.sothis, mirroring .cargo and .bun; never under AppData.
+  PROFILE_DIR="${USERPROFILE:-${HOME:-}}"
+  [ -n "$PROFILE_DIR" ] || die "USERPROFILE is not set"
   if have cygpath; then
-    BIN_DIR="$(cygpath -u "$LOCALAPPDATA")/Sothis/bin"
+    BIN_DIR="$(cygpath -u "$PROFILE_DIR")/.sothis/bin"
   else
-    BIN_DIR="$LOCALAPPDATA/Sothis/bin"
+    BIN_DIR="${PROFILE_DIR%/}/.sothis/bin"
   fi
 else
   [ -n "${HOME:-}" ] || die "HOME is not set"
@@ -442,6 +451,7 @@ set -- install --profile "$PROFILE"
 [ "$ALLOW_MISSING_COSIGN" -eq 0 ] || set -- "$@" --allow-missing-cosign
 [ "$NO_MODIFY_PATH" -eq 0 ] || set -- "$@" --no-modify-path
 [ "$NO_PLUGINS" -eq 0 ] || set -- "$@" --no-plugins
+[ "$ALLOW_VIRTUALIZED" -eq 0 ] || set -- "$@" --allow-virtualized-root
 note "running: sothis $*"
 # Not exec: the EXIT trap must still remove the temporary directory.
 "$DEST" "$@"

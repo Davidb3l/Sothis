@@ -90,6 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/Davidb3l/Sothis/main/scripts/instal
 | `-AllowMissingCosign` | `--allow-missing-cosign` | Accept checksum-only verification if cosign is absent (also passed to `sothis install`) |
 | `-NoModifyPath` | `--no-modify-path` | Passed to `sothis install` |
 | `-NoPlugins` | `--no-plugins` | Passed to `sothis install` |
+| `-AllowVirtualizedRoot` | `--allow-virtualized-root` | Passed to `sothis install`; see [Running from the Claude desktop app on Windows](#running-from-the-claude-desktop-app-on-windows) (also `SOTHIS_ALLOW_VIRTUALIZED_ROOT=1`) |
 
 The scripts fail closed: a sha256 that does not match, a missing checksum, a
 missing cosign (without the opt-out) or a signature cosign rejects stops the
@@ -146,7 +147,7 @@ through the `claude` CLI (`sothis@sothis`, plus each tool's plugin). Pass
 ### Day to day
 
 ```sh
-sothis update              # move managed tools to the manifest's recommended versions
+sothis update              # move managed tools to the manifest's recommended versions and refresh installed suite plugins
 sothis rollback <tool>     # return one tool to its previous retained version
 sothis uninstall           # remove what Sothis installed, in reverse order (--plugins also removes plugins)
 sothis doctor              # check the install (see below)
@@ -155,7 +156,14 @@ sothis manifest validate   # validate the embedded suite contract
 ```
 
 `update` never downgrades without `--allow-downgrade`, and leaves tools it did
-not install alone (reporting them as `unmanaged`). `uninstall` never touches
+not install alone (reporting them as `unmanaged`). It also refreshes the Claude
+plugins: one `claude plugin marketplace update sothis`, then `claude plugin
+update <name>@sothis` for each suite plugin that is installed (the tools' plugins
+and `sothis@sothis`), each reported as `updated`, `up-to-date` or `failed`
+(restart Claude Code to apply). A failed plugin step never changes the result of
+a binary update; `--no-plugins` skips all of it, and `sothis update --plan` lists
+the steps. `sothis install` only installs missing plugins; for one that is
+already installed it says to run `sothis update`. `uninstall` never touches
 tool data (`.ametrite`, `.hayven`, `.sirius`, `.suite`).
 
 `sothis doctor [--profile <p>]` exits `0` only when nothing it checks has
@@ -181,9 +189,13 @@ Output marks each line `[OK]`, `[WARN]`, `[FAIL]` or `[SKIP]`; `--json` adds a
 
 | | State root (receipts, retained versions, staging) | Bin directory (what lands on `PATH`) |
 | --- | --- | --- |
-| Windows | `%LOCALAPPDATA%\Sothis` | `%LOCALAPPDATA%\Sothis\bin` |
+| Windows | `%USERPROFILE%\.sothis` | `%USERPROFILE%\.sothis\bin` |
 | macOS / Linux | `$XDG_DATA_HOME/sothis`, else `~/.local/share/sothis` | `~/.local/bin` |
 | `SOTHIS_HOME=<abs dir>` | `<dir>` | `<dir>/bin` |
+
+The Windows root is a dot-directory in your profile, like `.cargo` and `.bun`,
+and deliberately **not** under `%LOCALAPPDATA%` (v0.1.0's default); see
+[Running from the Claude desktop app on Windows](#running-from-the-claude-desktop-app-on-windows).
 
 `SOTHIS_HOME` replaces the whole layout on every OS; use it to try an install
 in a throwaway directory (`--no-modify-path --no-plugins` keep it hermetic).
@@ -201,6 +213,53 @@ Sothis never edits shell profiles; it prints the line to add, for example
 `export PATH="$HOME/.local/bin:$PATH"`. If another directory earlier on `PATH`
 provides the same command, the install says so (and `sothis doctor` keeps
 saying so until it is fixed).
+
+If a v0.1.0 install is still at `%LOCALAPPDATA%\Sothis`, `sothis install` removes
+exactly that one entry (`%LOCALAPPDATA%\Sothis\bin`, in any spelling) from your
+user `PATH` while adding the new bin directory, and reports it as a migration
+line. It leaves everything else on `PATH` alone, and it never adopts or deletes
+the old folder; it prints how to remove it instead (`sothis doctor` warns as
+`legacy_root`):
+
+```powershell
+$env:SOTHIS_HOME = "$env:LOCALAPPDATA\Sothis"
+sothis uninstall --profile <the profile you installed> --no-modify-path
+# then delete the %LOCALAPPDATA%\Sothis folder
+```
+
+### Running from the Claude desktop app on Windows
+
+Processes started by the Claude desktop app (Claude Code's shells, and so
+`sothis` and `install.ps1`) have **their new writes under `%LOCALAPPDATA%` and
+`%APPDATA%` silently redirected** by Windows file-system virtualization into
+`%LOCALAPPDATA%\Packages\<package>\LocalCache\...`. This happens even though
+such a process reports no package identity, so it cannot be predicted from the
+process; it can only be observed. Registry writes (the user `PATH`) are not
+redirected. So v0.1.0, which installed under `%LOCALAPPDATA%\Sothis`, put the
+tools where only the virtualized processes could see them while the `PATH` edit
+pointed every other process at a directory that does not exist.
+
+Since v0.1.1 the default root is `%USERPROFILE%\.sothis`, which is not
+virtualized (the same reason the per-tool installers that write to
+`%USERPROFILE%\.local\bin` or `%USERPROFILE%\.cargo\bin` work from Claude
+sessions). In addition, Sothis checks by experiment: it creates a uniquely named
+probe file in the target directory (the nearest existing ancestor if the root
+does not exist yet), asks Windows where the open handle really lives
+(`GetFinalPathNameByHandle`), and deletes it. If the file landed under
+`...\Packages\<package>\LocalCache\...` the directory is virtualized. A probe
+that cannot be completed is "unknown", never a failure.
+
+- `sothis doctor` **fails** `root_not_virtualized` (naming the package folder)
+  when the root, including a `SOTHIS_HOME` override, is virtualized, and passes
+  it otherwise.
+- `sothis install` and `sothis update` run the probe before writing anything
+  else and refuse, writing nothing, unless you pass `--allow-virtualized-root`
+  (or set `SOTHIS_ALLOW_VIRTUALIZED_ROOT=1`).
+- `install.ps1` does the same before placing `sothis.exe`, only when the target
+  is under `%LOCALAPPDATA%` or `%APPDATA%` (`-AllowVirtualizedRoot` to
+  override); the default location never needs it.
+
+A normal terminal is not virtualized, so none of this changes anything there.
 
 ### Windows Smart App Control
 
@@ -355,7 +414,7 @@ rolled back.
 - **`os error 4551`** on Windows: see
   [Windows Smart App Control](#windows-smart-app-control).
 
-Update the suite plugin with `claude plugin update sothis@sothis` when a new
+Update the suite plugin (and the tools' plugins) with `sothis update` when a new
 release lands. A tool you installed some other way is left alone: `sothis
 update` reports it as `unmanaged`, and `sothis install` takes it over only after
 backing the existing file up.
